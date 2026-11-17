@@ -16,7 +16,7 @@ The installer does not change SSH password/root-login settings and does not rese
 
 ## Install
 
-Review the script before running it. Run from an existing SSH session with an alternate recovery path available:
+Review the installer before running it. Run from an existing SSH session with an alternate recovery path available:
 
 ```bash
 sudo bash nilana-vps-installer.sh
@@ -28,29 +28,37 @@ To permit Squid and BadVPN from a **specific trusted client IP/CIDR**, set the e
 sudo env NILANA_ALLOWED_CIDR=198.51.100.8/32 bash nilana-vps-installer.sh
 ```
 
-Replace that documentation-only IP with your real trusted client address. Do not use `0.0.0.0/0` for an unauthenticated proxy or UDP gateway. If you need a public proxy, add proper client authentication and narrowly scoped network policy first. Without the variable, both services listen on loopback only.
+Replace that documentation-only IP with your real trusted client address. Do not use `0.0.0.0/0` for an unauthenticated proxy or UDP gateway. Without the variable, both services listen on loopback only.
 
 The installer creates a self-signed Stunnel certificate at `/etc/stunnel/nilana.pem`. SSH still performs user authentication through Stunnel; TLS certificate trust is separate. Replace the self-signed certificate with one issued for a domain you control before relying on server identity validation.
 
-## Uninstall
+## VPS management and uninstall
 
-Run this from the same script on the server:
-
-```bash
-sudo bash nilana-vps-installer.sh --uninstall
-```
-
-The script asks you to type `UNINSTALL` before proceeding. For unattended use, explicitly confirm with:
+Install the management command on the VPS:
 
 ```bash
-sudo bash nilana-vps-installer.sh --uninstall --yes
+sudo bash nilana-vps-manager.sh install
 ```
 
-Uninstall stops/removes the Nilana BadVPN unit and binary, removes the Nilana TLS certificate, restores configuration files saved as `.nilana.bak`, removes Nilana-only configuration files that did not previously exist, reapplies sysctl settings, and reloads/restarts affected services where safe. It deliberately does not purge Ubuntu packages, alter firewall rules, remove OpenSSH, or change Oracle Cloud VCN rules. Review and purge packages manually only if they were installed for Nilana and are not needed elsewhere.
+Then use:
+
+```bash
+nilana-vps                 # interactive menu
+nilana-vps status          # service status and relevant listening sockets
+sudo nilana-vps uninstall  # prompts for the word UNINSTALL
+```
+
+For unattended use, explicitly confirm:
+
+```bash
+sudo nilana-vps uninstall --yes
+```
+
+Uninstall stops/removes the Nilana BadVPN unit and binary, removes Nilana TLS certificates, restores configuration files saved as `.nilana.bak`, removes Nilana-only files that did not previously exist, reapplies sysctl settings, and reloads/restarts affected services where safe. If no backup exists for a service config, it leaves that config in place rather than guessing whether it belongs to another setup. It deliberately does not purge packages, alter firewall rules, remove OpenSSH, or change Oracle Cloud VCN rules.
 
 ## Oracle Cloud networking
 
-Add only the ingress rules you need to the VCN security list or network security group. SSH/Dropbear/Stunnel ports may need inbound TCP rules (22, 442, 555, 443, 445). If you explicitly configured a trusted CIDR, proxy access should be limited to that source on TCP 3128, 8000, and 8080; BadVPN should likewise be limited to the trusted source on TCP 7300. The instance firewall must also permit the intended connections. This script deliberately does not rewrite firewall policy.
+Add only the ingress rules you need to the VCN security list or network security group. SSH/Dropbear/Stunnel ports may need inbound TCP rules (22, 442, 555, 443, 445). If you explicitly configured a trusted CIDR, proxy access should be limited to that source on TCP 3128, 8000, and 8080; BadVPN should likewise be limited to the trusted source on TCP 7300. The instance firewall must also permit intended connections. The installer deliberately does not rewrite firewall policy.
 
 ## Low latency
 
