@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 MANAGER_PATH=/usr/local/sbin/nilana-vps
+INSTALLER_PATH=/usr/local/sbin/nilana-install.sh
+REPO_RAW=https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -11,7 +13,7 @@ status() {
   printf '%-20s %s\n' SERVICE STATUS
   printf '%-20s %s\n' '--------------------' '------'
   local unit
-  for unit in ssh dropbear stunnel4 squid nilana-badvpn fail2ban; do
+  for unit in ssh nilana-dropbear nilana-stunnel squid nilana-badvpn; do
     if systemctl is-active --quiet "$unit"; then
       printf '%-20s %s\n' "$unit" active
     else
@@ -20,6 +22,39 @@ status() {
   done
   printf '\nListening sockets:\n'
   ss -lntup 2>/dev/null | grep -E ':(22|442|443|445|555|3128|7300|8000|8080)([[:space:]]|$)' || true
+}
+
+update_system() {
+  require_root
+  if [[ ${1:-} != --yes ]]; then
+    [[ -t 0 ]] || die 'Non-interactive update requires: nilana-vps update --yes'
+    cat <<'NOTICE'
+This downloads the latest installer and manager scripts from the NilanaVPS
+GitHub repository, validates their Bash syntax, then reruns the installer.
+The installer reapplies Nilana-managed configuration and restarts its services.
+It is designed to preserve user accounts; make a VPS snapshot/backup first.
+NOTICE
+    read -r -p 'Type UPDATE to continue: ' answer
+    [[ $answer == UPDATE ]] || die 'Update cancelled.'
+  fi
+
+  local work
+  work=$(mktemp -d)
+  trap 'rm -rf -- "$work"' RETURN
+  log 'Downloading the latest Nilana VPS scripts'
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+    "$REPO_RAW/install.sh" -o "$work/install.sh" || die 'Could not download the installer.'
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+    "$REPO_RAW/nilana-vps-manager.sh" -o "$work/nilana-vps-manager.sh" || die 'Could not download the manager.'
+  bash -n "$work/install.sh" || die 'Downloaded installer failed Bash syntax validation; nothing was applied.'
+  bash -n "$work/nilana-vps-manager.sh" || die 'Downloaded manager failed Bash syntax validation; nothing was applied.'
+
+  install -D -m 0755 "$work/install.sh" "$INSTALLER_PATH"
+  install -D -m 0755 "$work/nilana-vps-manager.sh" "$MANAGER_PATH"
+  log 'Scripts validated and installed. Starting the latest installer now.'
+  "$INSTALLER_PATH" --yes --no-upgrade
+  log 'Update run finished. The installer refreshed the main menu and managed services.'
+  printf 'If you were using the separate manager menu, exit and run %s again to load its updated copy.\n' "$MANAGER_PATH"
 }
 
 restore_or_remove() {
@@ -48,8 +83,8 @@ uninstall() {
     [[ $answer == UNINSTALL ]] || die 'Uninstall cancelled.'
   fi
 
-  log 'Stopping Nilana BadVPN service'
-  systemctl disable --now nilana-badvpn.service 2>/dev/null || true
+  log 'Stopping Nilana services'
+  systemctl disable --now nilana-badvpn.service nilana-stunnel.service nilana-dropbear.service 2>/dev/null || true
 
   local file
   for file in \
@@ -66,6 +101,8 @@ uninstall() {
   done
 
   rm -f /etc/systemd/system/nilana-badvpn.service \
+    /etc/systemd/system/nilana-stunnel.service \
+    /etc/systemd/system/nilana-dropbear.service \
     /usr/local/sbin/nilana-udpgw \
     /etc/stunnel/nilana.pem /etc/stunnel/nilana.key /etc/stunnel/nilana.crt
   systemctl daemon-reload
@@ -77,7 +114,7 @@ uninstall() {
     log 'SSH config test failed; leaving the SSH daemon untouched.'
   fi
   systemctl try-restart dropbear stunnel4 squid fail2ban 2>/dev/null || true
-  rm -f -- "$MANAGER_PATH"
+  rm -f -- "$MANAGER_PATH" "$INSTALLER_PATH"
 
   cat <<'DONE'
 
@@ -92,11 +129,13 @@ show_help() {
 Nilana VPS management
 
 Usage:
-  nilana-vps               Show an interactive management menu
-  nilana-vps status        Show service status and relevant listening sockets
-  nilana-vps uninstall     Confirm and uninstall Nilana customizations
-  nilana-vps uninstall --yes  Confirm non-interactively
-  nilana-vps help          Show this help
+  nilana-vps                   Show the management menu
+  nilana-vps status            Show service status and relevant listening sockets
+  nilana-vps update            Download and run the latest Nilana VPS installer
+  nilana-vps update --yes      Run update without interactive confirmation
+  nilana-vps uninstall         Confirm and uninstall Nilana customizations
+  nilana-vps uninstall --yes   Uninstall without interactive confirmation
+  nilana-vps help              Show this help
 
 Install this command from the repository with:
   sudo bash nilana-vps-manager.sh install
@@ -109,10 +148,13 @@ case "${1:-menu}" in
     [[ -f "$0" ]] || die 'Cannot locate manager script to install.'
     install -m 0755 -- "$0" "$MANAGER_PATH"
     log "Installed management command: $MANAGER_PATH"
-    printf 'Run: nilana-vps status  or  sudo nilana-vps uninstall\n'
+    printf 'Run: nilana-vps status, nilana-vps update, or sudo nilana-vps uninstall\n'
     ;;
   status)
     status
+    ;;
+  update)
+    update_system "${2:-}"
     ;;
   uninstall)
     uninstall "${2:-}"
@@ -123,11 +165,12 @@ case "${1:-menu}" in
   menu)
     [[ -t 0 ]] || { show_help; exit 0; }
     while true; do
-      printf '\n=== Nilana VPS Management ===\n1) Service status\n2) Uninstall Nilana VPS\n0) Exit\n'
+      printf '\n=== Nilana VPS Management ===\n1) Service status\n2) Update Nilana VPS\n3) Uninstall Nilana VPS\n0) Exit\n'
       read -r -p 'Select: ' choice
       case "$choice" in
         1) status ;;
-        2) uninstall ;;
+        2) update_system ;;
+        3) uninstall ;;
         0) exit 0 ;;
         *) printf 'Invalid selection.\n' ;;
       esac
