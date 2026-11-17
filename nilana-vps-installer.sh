@@ -15,7 +15,7 @@ backup_once() {
 uninstall_nilana() {
   log 'Removing Nilana VPS customizations and restoring saved configuration'
 
-  for unit in nilana-badvpn.service; do
+  for unit in nilana-badvpn.service nilana-stunnel.service; do
     systemctl disable --now "$unit" 2>/dev/null || true
   done
 
@@ -29,6 +29,7 @@ uninstall_nilana() {
     /etc/default/dropbear \
     /etc/stunnel/stunnel.conf \
     /etc/default/stunnel4 \
+    /etc/systemd/system/nilana-stunnel.service \
     /etc/squid/squid.conf \
     /etc/fail2ban/jail.d/nilana.local \
     /etc/sysctl.d/99-nilana-network.conf; do
@@ -37,7 +38,7 @@ uninstall_nilana() {
       log "Restored $file"
     else
       case "$file" in
-        /etc/issue.net|/etc/ssh/sshd_config.d/00-nilana.conf|/etc/fail2ban/jail.d/nilana.local|/etc/sysctl.d/99-nilana-network.conf)
+        /etc/issue.net|/etc/ssh/sshd_config.d/00-nilana.conf|/etc/systemd/system/nilana-stunnel.service|/etc/fail2ban/jail.d/nilana.local|/etc/sysctl.d/99-nilana-network.conf)
           rm -f -- "$file"
           log "Removed $file"
           ;;
@@ -57,7 +58,7 @@ uninstall_nilana() {
   else
     log 'Warning: SSH config test failed; leaving the SSH daemon untouched.'
   fi
-  systemctl try-restart dropbear stunnel4 squid fail2ban 2>/dev/null || true
+  systemctl try-restart dropbear squid fail2ban 2>/dev/null || true
 
   cat <<'UNINSTALL_DONE'
 
@@ -122,9 +123,9 @@ backup_once /etc/issue.net
 cat >/etc/issue.net <<'BANNER'
  _   _ _ _          _   _   _   _ ____  ____
 | \ | (_) | _____  | \ | | | | | |  _ \/ ___|
-|  \| | | |/ / _ \ |  \| | | | | | |_) \___ \
-| |\  | |   <  __/ | |\  | | |_| |  __/ ___) |
-|_| \_|_|_|\_\___| |_| \_|  \___/|_|   |____/
+|  \| | | |/ / _ \ |  \| | | | | | |_) \___ \\
+| |\  | | |   <  __/ | |\  | | |_| |  __/ ___) |
+|_| \_|_|_|_|\_\___| |_| \_|  \___/|_|   |____/
 
 Nilana VPS | Authorized access only
 BANNER
@@ -183,16 +184,35 @@ accept = 0.0.0.0:445
 connect = 127.0.0.1:442
 cert = /etc/stunnel/nilana.pem
 STUNNEL
+# Ubuntu's stunnel4 package can expose a SysV init script without a usable
+# systemd unit. `systemctl enable stunnel4` then calls systemd-sysv-install and
+# may fail. Use a Nilana-owned native unit instead of the SysV compatibility path.
 if [[ -f /etc/default/stunnel4 ]]; then
   backup_once /etc/default/stunnel4
   if grep -q '^ENABLED=' /etc/default/stunnel4; then
-    sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4
+    sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/stunnel4
   else
-    printf '\nENABLED=1\n' >>/etc/default/stunnel4
+    printf '\nENABLED=0\n' >>/etc/default/stunnel4
   fi
 fi
-systemctl enable stunnel4
-systemctl restart stunnel4
+backup_once /etc/systemd/system/nilana-stunnel.service
+cat >/etc/systemd/system/nilana-stunnel.service <<'STUNNEL_UNIT'
+[Unit]
+Description=Nilana VPS Stunnel TLS proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/stunnel4 /etc/stunnel/stunnel.conf
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+STUNNEL_UNIT
+systemctl daemon-reload
+systemctl enable --now nilana-stunnel.service
 
 log 'Configuring Squid with a deny-by-default client ACL'
 backup_once /etc/squid/squid.conf
@@ -293,7 +313,7 @@ else
 fi
 
 log 'Installation complete; checking service states'
-for unit in ssh dropbear stunnel4 squid nilana-badvpn fail2ban; do
+for unit in ssh dropbear nilana-stunnel squid nilana-badvpn fail2ban; do
   if ! systemctl is-active --quiet "$unit"; then
     systemctl --no-pager --full status "$unit" || true
     die "Service $unit is not active; inspect its status above."
