@@ -1,78 +1,101 @@
 # Nilana VPS
 
-A transparent installer for Ubuntu Server 20.04, 22.04, and 24.04. It configures OpenSSH, Dropbear, Stunnel, Squid, BadVPN UDP gateway, a Nilana login banner, Fail2ban, and optional BBR congestion control.
+One-command **SSH / Dropbear / SSL (Stunnel) / Squid / BadVPN-udpgw** installer with a user-management menu,
+custom server banner, account expiry and optional one-device-per-account limiting.
 
-## Services and ports
+* **Ubuntu 20.04 · 22.04 · 24.04** (x86_64 and ARM64)
+* Tuned for **Oracle Cloud Always Free** VPS (AMD Micro and Ampere A1)
 
-| Service | Port(s) | Default exposure |
-| --- | --- | --- |
-| OpenSSH | TCP 22 | Public, using the existing SSH authentication policy |
-| Dropbear | TCP 442, 555 | Public |
-| Stunnel (TLS-wrapped SSH/Dropbear) | TCP 443, 445 | Public; self-signed certificate by default |
-| Squid | TCP 3128, 8000, 8080 | Loopback only unless a trusted client CIDR is supplied |
-| BadVPN UDP gateway | TCP 7300 | Loopback only unless a trusted client CIDR is supplied |
-
-The installer does not change SSH password/root-login settings and does not reset or enable UFW. This avoids silently weakening SSH or risking a remote firewall lockout. Review your existing firewall and Oracle Cloud VCN rules before exposing listeners.
+| Service       | Port(s)          |
+|---------------|------------------|
+| OpenSSH       | 22               |
+| Dropbear      | 442, 555         |
+| Stunnel (SSL) | 443 → 442, 445 → 555 |
+| Squid         | 3128, 8000, 8080 |
+| BadVPN-udpgw  | 7300 (127.0.0.1) |
 
 ## Install
 
-Review the installer before running it. Run from an existing SSH session with an alternate recovery path available:
+Log in to the VPS and run as root (`sudo -i` first on Oracle's `ubuntu` user):
 
 ```bash
-sudo bash nilana-vps-installer.sh
+wget -O install.sh https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/Nilana-VPS/main/install.sh
+sudo bash install.sh
 ```
 
-To permit Squid and BadVPN from a **specific trusted client IP/CIDR**, set the environment variable when running the installer, for example:
+Options: `-y` (no questions) · `--no-upgrade` (skip `apt upgrade`).
+Everything is logged to `/var/log/nilana-install.log`. The installer is safe to re-run.
 
-```bash
-sudo env NILANA_ALLOWED_CIDR=198.51.100.8/32 bash nilana-vps-installer.sh
+### Oracle Cloud: one manual step
+
+Oracle blocks traffic **before** it reaches your VM, so the script cannot open this for you.
+Console → *Networking → Virtual Cloud Networks → your VCN → Security Lists → Add Ingress Rules*:
+
+* Source CIDR `0.0.0.0/0`, protocol **TCP**, destination ports `442,443,445,555,3128,8000,8080`
+  (port 22 is already open).
+
+The installer already opens the same ports in the VM's own firewall (Oracle Ubuntu images ship an
+`iptables` REJECT rule that `ufw` does not override) and saves them so they survive a reboot.
+
+## Use
+
+Type `menu` (or `nilana`) as root:
+
+```
+ 1) Ports List              9) Online Users
+ 2) Add User               10) Multi-login Limit ON/OFF
+ 3) Renew User             11) Services Status
+ 4) Delete User            12) Restart All Services
+ 5) Lock / Unlock User     13) Banner Settings
+ 6) Users List             14) Speedtest
+ 7) Expired Users          15) Monitor (htop)
+ 8) Active Users           16) Change User Password
+17) Update Server IP        0) Quit
 ```
 
-Replace that documentation-only IP with your real trusted client address. Do not use `0.0.0.0/0` for an unauthenticated proxy or UDP gateway. Without the variable, both services listen on loopback only.
+* Accounts are tunnel-only (`/bin/false`, no home directory). "Days" can be `30` or a date `2027-01-31`.
+* Expired accounts are locked automatically (checked every 30 min) and disconnected.
+* **Multi-login limit** (default OFF): when ON, only the newest connection of each account stays online.
+  Admin accounts such as `ubuntu` are never touched.
+* **Banner**: `/etc/issue.net` is shown by OpenSSH and Dropbear. Menu → *Banner Settings* switches between
+  the colourful HTML banner (rendered by HTTP-tunnel apps) and a plain-text one, or lets you edit it.
+  Keep it **under 2000 bytes** – Dropbear silently ignores larger banners.
+* **Squid** only forwards `CONNECT` requests to this server itself (not an open proxy).
+  If your public IP changes, run menu → *Update Server IP*.
+* **BadVPN** listens on `127.0.0.1:7300` (use it *through* the SSH tunnel, "UDPGW 127.0.0.1:7300").
+  To expose it publicly, set `UDPGW_LISTEN="0.0.0.0"` at the top of `install.sh` before installing.
 
-The installer creates a self-signed Stunnel certificate at `/etc/stunnel/nilana.pem`. SSH still performs user authentication through Stunnel; TLS certificate trust is separate. Replace the self-signed certificate with one issued for a domain you control before relying on server identity validation.
+## What was fixed compared with Debian_SSH_VPS_script
 
-## VPS management and uninstall
+| Problem in the original | Fix |
+|---|---|
+| `apt-get install … python …` – package no longer exists on Ubuntu 20.04+, so the **whole** command failed | removed; Python 3 is used only where needed |
+| `systemd-sysv-install enable stunnel4` fails: Ubuntu 22.04/24.04 ship the stunnel4 init script in a *disabled* state | Nilana never enables the distro init script; it masks it and runs its own `nilana-stunnel.service`. If the package's own post-install step aborts, the installer repairs it |
+| `stunnel.conf` defined two sections both named `[dropbear]` | unique section names |
+| `squid.conf` used `hierarchy_stoplist` / `manager` (removed in Squid ≥ 4) → Squid would not start | clean config valid on Squid 4, 5 and 6 |
+| Squid ACL used `ifconfig` (not installed) → empty IP; and on Oracle the public IP is not on the NIC | public IP from the internet + private IP from `ip route`, both allowed |
+| `rc.local` with a `/dev/nul` typo and useless NAT rules | proper `nilana-badvpn.service` |
+| `ufw enable` (interactive prompt) – and ufw cannot beat Oracle's default iptables REJECT rule | ports inserted into iptables (or ufw if it is active) and persisted |
+| Oracle cloud-init disables SSH password login | drop-in `00-nilana.conf` re-enables it and sets the banner |
+| Ookla `packagecloud` repo script breaks on newer Ubuntu | `speedtest-cli` from apt |
+| Interactive `needrestart` / dpkg prompts, apt lock held by unattended-upgrades | non-interactive mode, lock wait |
+| Dangerous clean-up lines (`rm *.txt`, `apt purge bind*`, `rm /tmp/*.txt` in the menu) | removed |
+| Menu quit after every action, accepted only day counts, listed wrong users | rewritten (loop, dates, only Nilana accounts) |
+| Expiry not enforced by Dropbear; autokill needed `auth.log` and a 12-line cron spam | expiry timer + journald-based limiter (systemd timers) |
+| Three near-identical scripts | one installer, features toggled in the menu |
 
-Install the management command on the VPS:
+## Tested
 
-```bash
-sudo bash nilana-vps-manager.sh install
-```
+Verified in a clean **Ubuntu 24.04 x86_64** sandbox by running this installer and starting the daemons with the
+generated unit commands: all 9 ports listen; SSH logins succeed through OpenSSH 22, Dropbear 442/555,
+Stunnel 443/445 and Squid 3128/8000/8080 (each reaching the UDPGW port through the tunnel); the banner is
+delivered; wrong passwords are rejected; Squid refuses foreign destinations; the installer is re-runnable.
+The Dropbear options were also checked against the Ubuntu 20.04 and 22.04 Dropbear packages.
+The sandbox has no running systemd, so unit start-up, the ARM build and the Oracle VCN rules were **not** exercised –
+check `menu → Services Status` after installing.
 
-Then use:
+## Credits & license
 
-```bash
-nilana-vps                 # interactive menu
-nilana-vps status          # service status and relevant listening sockets
-sudo nilana-vps uninstall  # prompts for the word UNINSTALL
-```
-
-For unattended use, explicitly confirm:
-
-```bash
-sudo nilana-vps uninstall --yes
-```
-
-Uninstall stops/removes the Nilana BadVPN unit and binary, removes Nilana TLS certificates, restores configuration files saved as `.nilana.bak`, removes Nilana-only files that did not previously exist, reapplies sysctl settings, and reloads/restarts affected services where safe. If no backup exists for a service config, it leaves that config in place rather than guessing whether it belongs to another setup. It deliberately does not purge packages, alter firewall rules, remove OpenSSH, or change Oracle Cloud VCN rules.
-
-## Oracle Cloud networking
-
-Add only the ingress rules you need to the VCN security list or network security group. SSH/Dropbear/Stunnel ports may need inbound TCP rules (22, 442, 555, 443, 445). If you explicitly configured a trusted CIDR, proxy access should be limited to that source on TCP 3128, 8000, and 8080; BadVPN should likewise be limited to the trusted source on TCP 7300. The instance firewall must also permit intended connections. The installer deliberately does not rewrite firewall policy.
-
-## Low latency
-
-The installer enables Linux BBR and the `fq` queue discipline only when the running kernel advertises BBR support. This can improve throughput under some network conditions; it cannot lower physical round-trip time or guarantee a ping improvement. VPS region, client distance, route quality, and packet loss are usually more important. No aggressive buffer or TCP timeout overrides are applied.
-
-## Check services
-
-```bash
-systemctl --no-pager --full status ssh dropbear stunnel4 squid nilana-badvpn fail2ban
-ss -lntup
-```
-
-Review logs with `journalctl -u <service-name>`. Installer-created config backups use the `.nilana.bak` suffix when a prior file existed.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+Apache-2.0 (see `LICENSE`). Derived from *Debian_SSH_VPS_script* by Tharuka Sandaruwan, which is based on
+*AutoScriptVPS* by xiihaiqal. BadVPN by Ambroz Bizjak (`badvpn/` holds the 1.999.128 source as an offline fallback).
+Use only on servers you own, and make sure your use complies with your provider's terms.
