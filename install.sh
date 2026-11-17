@@ -183,7 +183,6 @@ cat >/etc/nilana/banner.html <<'__NILANA_BANNER_HTML__'
 <p style="text-align:center"><span style="color:#ffffff">&#10008; No DDoS &bull; No hacking &bull; No spamming</span></p>
 <p style="text-align:center"><span style="color:#ffffff">&#10008; No torrent &bull; No illegal activity</span></p>
 <p style="text-align:center"><span style="color:#b388ff">Abuse = account banned without notice</span></p>
-<p style="text-align:center"><span style="color:#00e5ff"><b>&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;</b></span></p>
 <p style="text-align:center"><span style="color:#00ff88">Powered by <b>Nilana VPS</b></span></p>
 __NILANA_BANNER_HTML__
 cat >/etc/nilana/banner.txt <<'__NILANA_BANNER_TXT__'
@@ -304,6 +303,7 @@ chmod 600 /etc/stunnel/nilana.pem 2>/dev/null
 {
   echo "# Nilana VPS - Stunnel: TLS in front of Dropbear"
   echo "foreground = yes"
+  echo "pid = /run/stunnel4/stunnel.pid"
   echo "cert = /etc/stunnel/nilana.pem"
   echo "client = no"
   if id stunnel4 >/dev/null 2>&1; then echo "setuid = stunnel4"; echo "setgid = stunnel4"; fi
@@ -323,6 +323,9 @@ Wants=network-online.target nilana-dropbear.service
 
 [Service]
 Type=simple
+RuntimeDirectory=stunnel4
+RuntimeDirectoryMode=0755
+PIDFile=/run/stunnel4/stunnel.pid
 ExecStart=$STUNNEL_BIN /etc/nilana/stunnel.conf
 Restart=always
 RestartSec=2
