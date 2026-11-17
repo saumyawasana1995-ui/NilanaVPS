@@ -116,7 +116,7 @@ log 'Installing packages'
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl openssl openssh-server dropbear stunnel4 squid \
-  fail2ban build-essential cmake pkg-config libssl-dev libcap-dev python3
+  fail2ban build-essential cmake pkg-config libssl-dev libcap-dev python3 bzip2
 
 log 'Writing Nilana VPS login banner'
 backup_once /etc/issue.net
@@ -245,11 +245,14 @@ if [[ ! -x /usr/local/sbin/nilana-udpgw ]]; then
   workdir=$(mktemp -d)
   trap 'rm -rf "$workdir"' EXIT
   curl --fail --location --silent --show-error \
-    https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.128.tar.gz \
-    -o "$workdir/badvpn.tar.gz"
-  tar -xzf "$workdir/badvpn.tar.gz" -C "$workdir"
-  source_dir=$(find "$workdir" -maxdepth 1 -type d -name 'badvpn-*' -print -quit)
-  [[ -n "$source_dir" ]] || die 'BadVPN source archive did not contain the expected directory.'
+    https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/badvpn/badvpn-1.999.128.tar.bz2 \
+    -o "$workdir/badvpn.tar.bz2"
+  printf '%s  %s\n' \
+    'afc932a7cbbc45fc9884424118c95c5c7d5ba1e5e611a043eb5c7d2c17d6c2a6' \
+    "$workdir/badvpn.tar.bz2" | sha256sum --check --status || die 'BadVPN archive checksum verification failed.'
+  tar -xjf "$workdir/badvpn.tar.bz2" -C "$workdir"
+  source_dir="$workdir/badvpn-1.999.128"
+  [[ -d "$source_dir" ]] || die 'BadVPN source archive did not contain the expected directory.'
   cmake -S "$source_dir" -B "$workdir/build" \
     -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
   cmake --build "$workdir/build" --parallel "$(nproc)"
