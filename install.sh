@@ -11,11 +11,11 @@
 #  Based on "Debian_SSH_VPS_script" by Tharuka Sandaruwan (Apache-2.0), which
 #  itself derives from xiihaiqal/AutoScriptVPS. Licensed under Apache-2.0.
 #
-#  Usage     : sudo bash install.sh [-y|--yes] [--no-upgrade] [-h|--help]
+#  Usage     : sudo bash install.sh [-y|--yes] [--no-upgrade] [--update] [--reset-banner] [-h|--help]
 # =============================================================================
 set -uo pipefail
 
-NILANA_VERSION="2.0.0"
+NILANA_VERSION="2.1.0"
 
 # ----------------------------------------------------------------- settings
 SSH_PORT=22
@@ -30,8 +30,14 @@ BADVPN_URLS=(
   "https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/badvpn/badvpn-1.999.128.tar.bz2"
 )
 
+# Set this to the RAW url of install.sh in YOUR GitHub repo before you publish it, e.g.
+# https://raw.githubusercontent.com/<user>/Nilana-VPS/main/install.sh   (menu -> Update Script uses it)
+UPDATE_URL_DEFAULT=""
+
 ASSUME_YES=0
 DO_UPGRADE=1
+UPDATE_MODE=0
+RESET_BANNER=0
 LOG=/var/log/nilana-install.log
 FAILED=()
 
@@ -74,6 +80,8 @@ Nilana VPS installer v$NILANA_VERSION
 
   -y, --yes        do not ask for confirmation
   --no-upgrade     skip "apt-get upgrade" (faster, but not recommended)
+  --update         update an existing install (keeps users, banner and settings)
+  --reset-banner   overwrite your banner with the default Nilana banner
   -h, --help       show this help
 EOF
 }
@@ -82,6 +90,8 @@ for a in "$@"; do
   case $a in
     -y|--yes) ASSUME_YES=1 ;;
     --no-upgrade) DO_UPGRADE=0 ;;
+    --update) UPDATE_MODE=1; ASSUME_YES=1; DO_UPGRADE=0 ;;
+    --reset-banner) RESET_BANNER=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
@@ -150,6 +160,25 @@ PRIVIP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1
 [ -n "$PUBIP" ] || die "No IPv4 address found."
 ok "Public IP: $PUBIP   Private IP: ${PRIVIP:-n/a}"
 
+# remember the update url of an existing install
+OLD_UPDATE_URL=$( ( . /etc/nilana/server.conf 2>/dev/null; echo "${UPDATE_URL:-}" ) )
+UPDATE_URL=${NILANA_UPDATE_URL:-${OLD_UPDATE_URL:-$UPDATE_URL_DEFAULT}}
+mkdir -p /etc/nilana
+STUNNEL_PORT_LIST=""; for m in "${STUNNEL_MAP[@]}"; do STUNNEL_PORT_LIST+="${m%%:*} "; done
+STUNNEL_PORT_LIST=${STUNNEL_PORT_LIST% }
+cat >/etc/nilana/server.conf <<CONFEOF
+# Nilana VPS settings (read by the menu)
+VERSION=$NILANA_VERSION
+PUBIP=$PUBIP
+PRIVIP=$PRIVIP
+SSH_PORT=$SSH_PORT
+DROPBEAR_PORTS="${DROPBEAR_PORTS[*]}"
+STUNNEL_PORTS="$STUNNEL_PORT_LIST"
+SQUID_PORTS="${SQUID_PORTS[*]}"
+UDPGW_PORT=$UDPGW_PORT
+UPDATE_URL="$UPDATE_URL"
+CONFEOF
+
 # ---------------------------------------------------------- time / sysctl
 step "System tuning"
 if timedatectl set-timezone "$TIMEZONE" 2>/dev/null || ln -fs "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; then
@@ -172,6 +201,7 @@ mkdir -p /etc/nilana
 
 # ------------------------------------------------------------------ banner
 step "Installing server banner"
+if [ ! -f /etc/nilana/banner.html ] || [ "$RESET_BANNER" -eq 1 ]; then
 cat >/etc/nilana/banner.html <<'__NILANA_BANNER_HTML__'
 <p style="text-align:center"><span style="color:#00e5ff"><b>&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;</b></span></p>
 <h1 style="text-align:center"><span style="color:#00e5ff"><b>&#9700; NILANA VPS &#9699;</b></span></h1>
@@ -183,6 +213,7 @@ cat >/etc/nilana/banner.html <<'__NILANA_BANNER_HTML__'
 <p style="text-align:center"><span style="color:#ffffff">&#10008; No DDoS &bull; No hacking &bull; No spamming</span></p>
 <p style="text-align:center"><span style="color:#ffffff">&#10008; No torrent &bull; No illegal activity</span></p>
 <p style="text-align:center"><span style="color:#b388ff">Abuse = account banned without notice</span></p>
+<p style="text-align:center"><span style="color:#00e5ff"><b>&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;</b></span></p>
 <p style="text-align:center"><span style="color:#00ff88">Powered by <b>Nilana VPS</b></span></p>
 __NILANA_BANNER_HTML__
 cat >/etc/nilana/banner.txt <<'__NILANA_BANNER_TXT__'
@@ -202,6 +233,9 @@ __NILANA_BANNER_TXT__
 [ -f /etc/nilana/issue.net.orig ] || { [ -f /etc/issue.net ] && cp /etc/issue.net /etc/nilana/issue.net.orig; }
 cp /etc/nilana/banner.html /etc/issue.net
 ok "Banner installed (/etc/issue.net, $(wc -c </etc/issue.net) bytes)"
+else
+  ok "Existing banner kept (use --reset-banner to restore the default)"
+fi
 
 # ----------------------------------------------------------------- OpenSSH
 step "Configuring OpenSSH (port $SSH_PORT)"
@@ -266,75 +300,132 @@ EOF
 ok "Dropbear service written"
 
 # ----------------------------------------------------------------- Stunnel
-step "Installing Stunnel / SSL (ports $(printf '%s ' "${STUNNEL_MAP[@]%%:*}" | sed 's/ $//'))"
-install_stunnel() {
-  apt_get install stunnel4 && return 0
-  warn "stunnel4 postinst failed (known update-rc.d / systemd-sysv-install problem) - repairing"
-  # Ubuntu 22.04+/24.04 ship the init script in a "disabled" state and the
-  # package's own 'enable' step can abort. We do not use that init script at all
-  # (Nilana uses its own systemd unit), so neutralise update-rc.d and finish configuring.
-  local shim; shim=$(mktemp -d)
-  printf '#!/bin/sh\nexit 0\n' >"$shim/update-rc.d"; chmod +x "$shim/update-rc.d"
-  PATH="$shim:$PATH" dpkg --configure -a
-  PATH="$shim:$PATH" apt_get -f install
-  rm -rf "$shim"
-  dpkg -s stunnel4 2>/dev/null | grep -q '^Status: install ok installed'
-}
-install_stunnel || fail "stunnel4 could not be installed"
-STUNNEL_BIN=$(command -v stunnel4 || true); [ -x "${STUNNEL_BIN:-}" ] || STUNNEL_BIN=/usr/bin/stunnel4
-# Disable the distro stunnel4 init service entirely (avoids systemd-sysv-install)
-systemctl stop stunnel4.service 2>/dev/null; systemctl mask stunnel4.service >/dev/null 2>&1
+step "Installing Stunnel / SSL (ports $STUNNEL_PORT_LIST)"
+cat >/usr/local/sbin/nilana-stunnel-setup.new <<'__NILANA_STUNNEL__'
+#!/usr/bin/env bash
+# Nilana VPS - (re)creates the Stunnel SSL service from scratch.
+# Safe to run at any time:   nilana-stunnel-setup            (repair + restart)
+#                            nilana-stunnel-setup --no-start (used by the installer)
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "Please run as root."; exit 1; }
+
+NO_START=0; [ "${1:-}" = "--no-start" ] && NO_START=1
+CONF=/etc/nilana/server.conf
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+read -r -a SSL_PORTS <<<"${STUNNEL_PORTS:-443 445}"
+read -r -a DB_PORTS  <<<"${DROPBEAR_PORTS:-442 555}"
+UNIT=/etc/systemd/system/nilana-stunnel.service
+PEM=/etc/stunnel/nilana.pem
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+
+say()  { printf '  %s\n' "$*"; }
+oops() { printf '  [FAIL] %s\n' "$*"; }
+
+# ---- 1. package (with repair of the update-rc.d / systemd-sysv-install problem)
+STUNNEL_BIN=$(command -v stunnel4 || true)
+if [ -z "$STUNNEL_BIN" ]; then
+  say "installing stunnel4 ..."
+  made=0
+  if [ ! -e /usr/sbin/policy-rc.d ]; then printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d; made=1; fi
+  APT=(-y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  if ! apt-get "${APT[@]}" install stunnel4; then
+    say "package post-install failed - repairing (known update-rc.d problem on Ubuntu 22.04/24.04)"
+    shim=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' >"$shim/update-rc.d"; chmod +x "$shim/update-rc.d"
+    PATH="$shim:$PATH" dpkg --configure -a
+    PATH="$shim:$PATH" apt-get "${APT[@]}" -f install
+    rm -rf "$shim"
+  fi
+  [ "$made" = 1 ] && rm -f /usr/sbin/policy-rc.d
+  STUNNEL_BIN=$(command -v stunnel4 || true)
+fi
+[ -x "${STUNNEL_BIN:-}" ] || { oops "stunnel4 is not installed (check your internet / apt)"; exit 1; }
+
+# ---- 2. the distro init service must never run (it fights for the ports and
+#         is the one that triggers the systemd-sysv-install error)
+systemctl stop stunnel4.service >/dev/null 2>&1
+systemctl mask stunnel4.service >/dev/null 2>&1
 [ -f /etc/default/stunnel4 ] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/stunnel4
 
-if [ ! -s /etc/stunnel/nilana.pem ]; then
-  mkdir -p /etc/stunnel
-  tmpk=$(mktemp); tmpc=$(mktemp)
+# ---- 3. certificate (key + cert in one file)
+if ! openssl x509 -in "$PEM" -noout >/dev/null 2>&1 || ! openssl pkey -in "$PEM" -noout >/dev/null 2>&1; then
+  say "creating TLS certificate ..."
+  mkdir -p /etc/stunnel; k=$(mktemp); c=$(mktemp)
   if openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-       -subj "/C=LK/O=Nilana VPS/CN=nilana-vps" -keyout "$tmpk" -out "$tmpc" >/dev/null 2>&1; then
-    ( umask 077; cat "$tmpk" "$tmpc" >/etc/stunnel/nilana.pem )
-    ok "TLS certificate generated (valid 10 years)"
-  else
-    fail "openssl could not create the TLS certificate"
-  fi
-  rm -f "$tmpk" "$tmpc"
+       -subj "/C=LK/O=Nilana VPS/CN=nilana-vps" -keyout "$k" -out "$c" >/dev/null 2>&1; then
+    ( umask 077; cat "$k" "$c" >"$PEM" )
+  else oops "openssl could not create the certificate"; rm -f "$k" "$c"; exit 1; fi
+  rm -f "$k" "$c"
 fi
-chmod 600 /etc/stunnel/nilana.pem 2>/dev/null
+chmod 600 "$PEM"
 
+# ---- 4. stunnel configuration (runs as root: no privilege-drop edge cases)
+mkdir -p /etc/nilana
 {
-  echo "# Nilana VPS - Stunnel: TLS in front of Dropbear"
+  echo "# Nilana VPS - Stunnel: TLS in front of Dropbear   (generated by nilana-stunnel-setup)"
   echo "foreground = yes"
-  echo "pid = /run/stunnel4/stunnel.pid"
-  echo "cert = /etc/stunnel/nilana.pem"
+  echo "cert = $PEM"
   echo "client = no"
-  if id stunnel4 >/dev/null 2>&1; then echo "setuid = stunnel4"; echo "setgid = stunnel4"; fi
   echo "debug = 4"
   echo "socket = a:SO_REUSEADDR=1"
   echo "socket = l:TCP_NODELAY=1"
   echo "socket = r:TCP_NODELAY=1"
-  for m in "${STUNNEL_MAP[@]}"; do
-    echo; echo "[nilana-ssl-${m%%:*}]"; echo "accept = ${m%%:*}"; echo "connect = 127.0.0.1:${m##*:}"
+  for i in "${!SSL_PORTS[@]}"; do
+    echo; echo "[nilana-ssl-${SSL_PORTS[$i]}]"
+    echo "accept = ${SSL_PORTS[$i]}"
+    echo "connect = 127.0.0.1:${DB_PORTS[$i]:-${DB_PORTS[0]}}"
   done
 } >/etc/nilana/stunnel.conf
-cat >/etc/systemd/system/nilana-stunnel.service <<EOF
+
+# ---- 5. systemd unit (never gives up, survives reboots)
+cat >"$UNIT" <<EOF
 [Unit]
-Description=Nilana VPS - Stunnel SSL ($(printf '%s ' "${STUNNEL_MAP[@]}"))
+Description=Nilana VPS - Stunnel SSL (${SSL_PORTS[*]})
 After=network-online.target nilana-dropbear.service
 Wants=network-online.target nilana-dropbear.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-RuntimeDirectory=stunnel4
-RuntimeDirectoryMode=0755
-PIDFile=/run/stunnel4/stunnel.pid
+ExecStartPre=/usr/bin/test -s $PEM
+ExecStartPre=/usr/bin/test -s /etc/nilana/stunnel.conf
 ExecStart=$STUNNEL_BIN /etc/nilana/stunnel.conf
 Restart=always
-RestartSec=2
+RestartSec=3
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-ok "Stunnel service written"
+
+# ---- 6. enable for boot - and PROVE it
+systemctl daemon-reload
+systemctl enable nilana-stunnel.service >/dev/null 2>&1
+if ! systemctl is-enabled --quiet nilana-stunnel.service 2>/dev/null; then
+  mkdir -p /etc/systemd/system/multi-user.target.wants
+  ln -sf "$UNIT" /etc/systemd/system/multi-user.target.wants/nilana-stunnel.service
+  systemctl daemon-reload
+fi
+if systemctl is-enabled --quiet nilana-stunnel.service 2>/dev/null; then say "[ OK ] enabled at boot"; else oops "could not enable at boot"; fi
+
+[ "$NO_START" = 1 ] && { say "[ OK ] stunnel service written"; exit 0; }
+
+# ---- 7. start and verify
+systemctl restart nilana-stunnel.service
+sleep 3
+rc=0
+if systemctl is-active --quiet nilana-stunnel.service; then say "[ OK ] nilana-stunnel is running"; else oops "nilana-stunnel is NOT running"; rc=1; fi
+for p in "${SSL_PORTS[@]}"; do
+  if ss -H -ltn "sport = :$p" 2>/dev/null | grep -q .; then say "[ OK ] listening on TCP $p"; else oops "nothing listens on TCP $p"; rc=1; fi
+done
+if [ "$rc" -ne 0 ]; then
+  echo; echo "  Last log lines (journalctl -u nilana-stunnel):"
+  journalctl -u nilana-stunnel -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+fi
+exit "$rc"
+__NILANA_STUNNEL__
+chmod 755 /usr/local/sbin/nilana-stunnel-setup.new && mv -f /usr/local/sbin/nilana-stunnel-setup.new /usr/local/sbin/nilana-stunnel-setup
+/usr/local/sbin/nilana-stunnel-setup --no-start || fail "stunnel setup failed (repair later with: menu -> Repair Stunnel)"
 
 # ------------------------------------------------------------------- Squid
 step "Installing Squid proxy (ports ${SQUID_PORTS[*]})"
@@ -422,7 +513,7 @@ fi
 
 # --------------------------------------------------------- tools and menu
 step "Installing management menu"
-cat >/usr/local/sbin/nilana-online <<'__NILANA_ONLINE__'
+cat >/usr/local/sbin/nilana-online.new <<'__NILANA_ONLINE__'
 #!/usr/bin/env python3
 """
 Nilana VPS - session tool
@@ -699,8 +790,8 @@ if __name__ == "__main__":
         sys.exit("run as root")
     main()
 __NILANA_ONLINE__
-chmod 755 /usr/local/sbin/nilana-online
-cat >/usr/local/bin/menu <<'__NILANA_MENU__'
+chmod 755 /usr/local/sbin/nilana-online.new && mv -f /usr/local/sbin/nilana-online.new /usr/local/sbin/nilana-online
+cat >/usr/local/bin/menu.new <<'__NILANA_MENU__'
 #!/usr/bin/env bash
 # Nilana VPS - management menu  (command: menu  |  nilana)
 
@@ -716,6 +807,7 @@ STUNNEL_PORTS=${STUNNEL_PORTS:-"443 445"}
 SQUID_PORTS=${SQUID_PORTS:-"3128 8000 8080"}
 UDPGW_PORT=${UDPGW_PORT:-7300}
 MARK="NilanaVPS"
+UPDATE_URL=${UPDATE_URL:-}
 SERVICES="ssh nilana-dropbear nilana-stunnel squid nilana-badvpn"
 
 C0=$'\e[0m'; CR=$'\e[31;1m'; CG=$'\e[32;1m'; CY=$'\e[33;1m'; CC=$'\e[36;1m'; CBL=$'\e[34;1m'
@@ -861,7 +953,10 @@ services_status() {
   for s in $SERVICES; do
     st=$(systemctl is-active "$s" 2>/dev/null)
     if [ "$st" = active ]; then printf '  %-18s %s%s%s\n' "$s" "$CG" "running" "$C0"
-    else printf '  %-18s %s%s%s\n' "$s" "$CR" "${st:-not found}" "$C0"; fi
+    else
+      printf '  %-18s %s%s%s\n' "$s" "$CR" "${st:-not found}" "$C0"
+      journalctl -u "$s" -n 4 --no-pager 2>/dev/null | sed 's/^/        /'
+    fi
   done
   line; echo "  Listening ports:"
   for p in $SSH_PORT $DROPBEAR_PORTS $STUNNEL_PORTS $SQUID_PORTS; do
@@ -922,6 +1017,112 @@ refresh_ip() {
   systemctl restart squid && ok "Server IP is now $new (Squid ACL refreshed)."
 }
 
+
+set_conf() {  # key value  (stored in /etc/nilana/server.conf)
+  local t; t=$(mktemp)
+  grep -v "^$1=" "$CONF" >"$t" 2>/dev/null; printf '%s="%s"\n' "$1" "$2" >>"$t"
+  cat "$t" >"$CONF"; rm -f "$t"
+}
+
+repair_stunnel() {
+  line; echo " Rebuilding Stunnel (certificate, config, service, boot link) ..."; line
+  if [ -x /usr/local/sbin/nilana-stunnel-setup ]; then /usr/local/sbin/nilana-stunnel-setup
+  else bad "nilana-stunnel-setup is missing - run: menu update"; fi
+}
+
+update_script() {
+  line; echo " Update Nilana VPS"; line
+  local url=${UPDATE_URL:-} tmp new a
+  if [ -z "$url" ]; then
+    echo " Enter the RAW url of install.sh in your GitHub repo, e.g."
+    echo " https://raw.githubusercontent.com/USER/Nilana-VPS/main/install.sh"
+    read -rp " URL: " url
+  fi
+  [[ $url =~ ^https://[^[:space:]]+$ ]] || { bad "Invalid URL (must start with https://)."; return; }
+  tmp=$(mktemp)
+  if ! curl -fsSL --retry 3 --max-time 60 -o "$tmp" "$url"; then bad "Download failed."; rm -f "$tmp"; return; fi
+  if ! bash -n "$tmp" 2>/dev/null || ! grep -q '^NILANA_VERSION=' "$tmp"; then
+    bad "That file is not a valid Nilana installer."; rm -f "$tmp"; return; fi
+  new=$(sed -n 's/^NILANA_VERSION="\(.*\)"/\1/p' "$tmp" | head -n1)
+  echo " Installed: ${VERSION:-unknown}     Available: ${new:-unknown}"
+  echo " Your users, banner and settings are kept."
+  read -rp " Update now? [y/N] " a
+  [[ $a =~ ^[Yy]$ ]] || { echo "Cancelled."; rm -f "$tmp"; return; }
+  set_conf UPDATE_URL "$url"
+  NILANA_UPDATE_URL="$url" bash "$tmp" --update
+  rm -f "$tmp"
+  echo; read -rp "Press Enter to reopen the menu..." _
+  exec /usr/local/bin/menu
+}
+
+uninstall_script() {
+  local a du dp u p b
+  line; printf '%s This removes Nilana VPS: services, menu, firewall rules and settings.%s\n' "$CR" "$C0"; line
+  read -rp " Type UNINSTALL to continue: " a
+  [ "$a" = UNINSTALL ] || { echo "Cancelled."; return; }
+  read -rp " Also delete ALL Nilana user accounts? [y/N] " du
+  read -rp " Also remove packages (dropbear-bin, stunnel4, squid)? [y/N] " dp
+  echo
+
+  echo " - stopping services"
+  for u in nilana-limiter.timer nilana-expire.timer nilana-limiter.service nilana-expire.service \
+           nilana-stunnel nilana-dropbear nilana-badvpn; do
+    systemctl disable --now "$u" >/dev/null 2>&1
+  done
+  rm -f /etc/systemd/system/nilana-*.service /etc/systemd/system/nilana-*.timer
+  find /etc/systemd/system -xtype l -name 'nilana-*' -delete 2>/dev/null
+  systemctl unmask dropbear.service stunnel4.service >/dev/null 2>&1
+  systemctl daemon-reload
+
+  if [[ $du =~ ^[Yy]$ ]]; then
+    echo " - deleting Nilana accounts"
+    while read -r u; do
+      [ -n "$u" ] || continue
+      nilana-online --kick-user "$u" >/dev/null 2>&1; pkill -KILL -u "$u" 2>/dev/null; userdel "$u" 2>/dev/null
+    done < <(nilana_users)
+  fi
+
+  echo " - restoring SSH settings and banner"
+  rm -f /etc/ssh/sshd_config.d/00-nilana.conf
+  [ -f /etc/nilana/issue.net.orig ] && cp /etc/nilana/issue.net.orig /etc/issue.net
+  if sshd -t 2>/dev/null; then systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; fi
+
+  echo " - removing firewall rules (port $SSH_PORT is left open)"
+  for p in $DROPBEAR_PORTS $STUNNEL_PORTS $SQUID_PORTS; do
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw delete allow "$p/tcp" >/dev/null 2>&1
+    fi
+    for b in iptables ip6tables; do
+      command -v "$b" >/dev/null 2>&1 || continue
+      while "$b" -w -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do :; done
+    done
+  done
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+
+  echo " - squid"
+  if [ -f /etc/squid/squid.conf.orig ]; then cp /etc/squid/squid.conf.orig /etc/squid/squid.conf; fi
+  rm -f /etc/squid/nilana-dst.conf
+
+  if [[ $dp =~ ^[Yy]$ ]]; then
+    echo " - removing packages"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y dropbear-bin stunnel4 squid >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1
+    rm -rf /etc/dropbear
+  else
+    systemctl restart squid >/dev/null 2>&1
+  fi
+
+  echo " - deleting files"
+  rm -f /etc/sysctl.d/99-nilana.conf /etc/profile.d/nilana.sh /etc/stunnel/nilana.pem \
+        /usr/local/bin/badvpn-udpgw /usr/local/sbin/nilana-online /usr/local/sbin/nilana-stunnel-setup \
+        /usr/local/bin/nilana
+  rm -rf /etc/nilana /run/nilana
+  rm -f /usr/local/bin/menu
+  echo; ok "Nilana VPS has been removed."
+  echo " (Reinstall any time with install.sh. The BBR setting is reset at the next reboot.)"
+  exit 0
+}
+
 # ---------------------------------------------------------------- main loop
 main_menu() {
   while true; do
@@ -936,10 +1137,12 @@ main_menu() {
    6) Users List             14) Speedtest
    7) Expired Users          15) Monitor (htop)
    8) Active Users           16) Change User Password
-  17) Update Server IP        0) Quit
+  17) Update Server IP       18) Repair Stunnel (SSL)
+  19) Update Script          20) Uninstall Script
+   0) Quit
 EOF
     line
-    read -rp " Choose [0-17]: " c
+    read -rp " Choose [0-20]: " c
     clear
     case $c in
       1) ports_list ;;
@@ -959,6 +1162,9 @@ EOF
       15) htop ;;
       16) pick_user && passwd "$U" ;;
       17) refresh_ip ;;
+      18) repair_stunnel ;;
+      19) update_script ;;
+      20) uninstall_script ;;
       0|q|Q) clear; exit 0 ;;
       *) bad "Invalid option." ;;
     esac
@@ -966,22 +1172,15 @@ EOF
   done
 }
 
-main_menu
+case "${1:-}" in
+  update)    update_script ;;
+  uninstall) uninstall_script ;;
+  repair|stunnel) repair_stunnel ;;
+  *) main_menu ;;
+esac
 __NILANA_MENU__
-chmod 755 /usr/local/bin/menu
+chmod 755 /usr/local/bin/menu.new && mv -f /usr/local/bin/menu.new /usr/local/bin/menu   # new inode: a running menu is never corrupted
 ln -sf /usr/local/bin/menu /usr/local/bin/nilana
-
-cat >/etc/nilana/server.conf <<EOF
-# Nilana VPS settings (read by the menu)
-VERSION=$NILANA_VERSION
-PUBIP=$PUBIP
-PRIVIP=$PRIVIP
-SSH_PORT=$SSH_PORT
-DROPBEAR_PORTS="${DROPBEAR_PORTS[*]}"
-STUNNEL_PORTS="$(printf '%s ' "${STUNNEL_MAP[@]%%:*}" | sed 's/ $//')"
-SQUID_PORTS="${SQUID_PORTS[*]}"
-UDPGW_PORT=$UDPGW_PORT
-EOF
 
 cat >/etc/systemd/system/nilana-expire.service <<'EOF'
 [Unit]
@@ -1063,6 +1262,9 @@ if ! ufw_active; then
   else mkdir -p /etc/iptables && iptables-save >/etc/iptables/rules.v4; fi
 fi
 ok "Opened TCP: ${TCP_PORTS[*]}"
+if ! ufw_active && [ -f /etc/iptables/rules.v4 ] && ! grep -q -- "--dport ${STUNNEL_MAP[0]%%:*} " /etc/iptables/rules.v4; then
+  fail "firewall rules were not saved to /etc/iptables/rules.v4 - ports could be blocked after a reboot"
+fi
 
 # ------------------------------------------------------------ start it all
 step "Starting services"
@@ -1074,6 +1276,15 @@ for u in nilana-dropbear nilana-stunnel squid nilana-badvpn; do
   systemctl restart "$u" 2>/dev/null
 done
 systemctl enable --now nilana-expire.timer >/dev/null 2>&1
+# prove every unit is enabled for the next boot (create the link by hand if systemctl could not)
+for u in nilana-dropbear nilana-stunnel squid nilana-badvpn; do
+  [ -f "/etc/systemd/system/$u.service" ] || [ "$u" = squid ] || continue
+  systemctl is-enabled --quiet "$u" 2>/dev/null && continue
+  warn "$u was not enabled for boot - fixing"
+  [ -f "/etc/systemd/system/$u.service" ] && ln -sf "/etc/systemd/system/$u.service" "/etc/systemd/system/multi-user.target.wants/$u.service"
+  systemctl daemon-reload; systemctl enable "$u" >/dev/null 2>&1
+  systemctl is-enabled --quiet "$u" 2>/dev/null || fail "$u will NOT start after a reboot"
+done
 sleep 3
 
 check_listen() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
@@ -1102,6 +1313,7 @@ printf '  %sStunnel SSL%s : %s\n' "$B" "$N" "$(printf '%s ' "${STUNNEL_MAP[@]%%:
 printf '  %sSquid%s       : %s\n' "$B" "$N" "${SQUID_PORTS[*]}"
 printf '  %sBadVPN UDPGW%s: %s:%s\n' "$B" "$N" "$UDPGW_LISTEN" "$UDPGW_PORT"
 printf '%s================================================================%s\n' "$C" "$N"
+if [ "$UPDATE_MODE" -eq 1 ]; then printf '  %sNilana VPS updated to v%s%s\n' "$G" "$NILANA_VERSION" "$N"; fi
 if [ ${#FAILED[@]} -eq 0 ]; then
   printf '  %sAll services are running.%s\n' "$G" "$N"
 else

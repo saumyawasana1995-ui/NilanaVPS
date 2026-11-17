@@ -23,7 +23,8 @@ wget -O install.sh https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/Nilana-V
 sudo bash install.sh
 ```
 
-Options: `-y` (no questions) · `--no-upgrade` (skip `apt upgrade`).
+Options: `-y` (no questions) · `--no-upgrade` (skip `apt upgrade`) · `--update` (update an existing install,
+keeps users/banner/settings) · `--reset-banner`.
 Everything is logged to `/var/log/nilana-install.log`. The installer is safe to re-run.
 
 ### Oracle Cloud: one manual step
@@ -50,9 +51,23 @@ Type `menu` (or `nilana`) as root:
  6) Users List             14) Speedtest
  7) Expired Users          15) Monitor (htop)
  8) Active Users           16) Change User Password
-17) Update Server IP        0) Quit
+17) Update Server IP       18) Repair Stunnel (SSL)
+19) Update Script          20) Uninstall Script
+ 0) Quit
 ```
 
+Shortcuts: `menu update` · `menu uninstall` · `menu repair`.
+
+* **Repair Stunnel** rebuilds the certificate, config, systemd service and boot link from scratch and shows the
+  log if it still fails. Manual check: `systemctl status nilana-stunnel` and `journalctl -u nilana-stunnel -n 30 --no-pager`.
+* **Update Script** downloads `install.sh` from your GitHub, checks it, shows installed vs. available version and
+  re-runs it in `--update` mode (your users, banner and settings are kept). Before publishing, set
+  `UPDATE_URL_DEFAULT` near the top of `install.sh` to your raw URL
+  (`https://raw.githubusercontent.com/<user>/Nilana-VPS/main/install.sh`); otherwise the menu asks for it once.
+  Only point it at a repository you control – the script runs as root.
+* **Uninstall Script** (type `UNINSTALL` to confirm) removes services, menu, firewall rules and settings, and
+  restores the original SSH config, banner and Squid config. Optionally deletes all Nilana accounts and the
+  packages. Port 22 is never touched.
 * Accounts are tunnel-only (`/bin/false`, no home directory). "Days" can be `30` or a date `2027-01-31`.
 * Expired accounts are locked automatically (checked every 30 min) and disconnected.
 * **Multi-login limit** (default OFF): when ON, only the newest connection of each account stays online.
@@ -70,7 +85,8 @@ Type `menu` (or `nilana`) as root:
 | Problem in the original | Fix |
 |---|---|
 | `apt-get install … python …` – package no longer exists on Ubuntu 20.04+, so the **whole** command failed | removed; Python 3 is used only where needed |
-| `systemd-sysv-install enable stunnel4` fails: Ubuntu 22.04/24.04 ship the stunnel4 init script in a *disabled* state | Nilana never enables the distro init script; it masks it and runs its own `nilana-stunnel.service`. If the package's own post-install step aborts, the installer repairs it |
+| `systemd-sysv-install enable stunnel4` fails: Ubuntu 22.04/24.04 ship the stunnel4 init script in a *disabled* state | Nilana never enables the distro init script; it masks it and runs its own `nilana-stunnel.service` (set up by the standalone, re-runnable `nilana-stunnel-setup`). If the package's own post-install step aborts, it is repaired |
+| Stunnel not coming back after a reboot | unit has no start-rate limit and pre-start checks, boot-enable is verified (link created by hand if `systemctl enable` fails), firewall persistence is verified, Stunnel runs without a privilege-drop step |
 | `stunnel.conf` defined two sections both named `[dropbear]` | unique section names |
 | `squid.conf` used `hierarchy_stoplist` / `manager` (removed in Squid ≥ 4) → Squid would not start | clean config valid on Squid 4, 5 and 6 |
 | Squid ACL used `ifconfig` (not installed) → empty IP; and on Oracle the public IP is not on the NIC | public IP from the internet + private IP from `ip route`, both allowed |
