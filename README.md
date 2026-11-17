@@ -32,6 +32,22 @@ Replace that documentation-only IP with your real trusted client address. Do not
 
 The installer creates a self-signed Stunnel certificate at `/etc/stunnel/nilana.pem`. SSH still performs user authentication through Stunnel; TLS certificate trust is separate. Replace the self-signed certificate with one issued for a domain you control before relying on server identity validation.
 
+## Uninstall
+
+Run this from the same script on the server:
+
+```bash
+sudo bash nilana-vps-installer.sh --uninstall
+```
+
+The script asks you to type `UNINSTALL` before proceeding. For unattended use, explicitly confirm with:
+
+```bash
+sudo bash nilana-vps-installer.sh --uninstall --yes
+```
+
+Uninstall stops/removes the Nilana BadVPN unit and binary, removes the Nilana TLS certificate, restores configuration files saved as `.nilana.bak`, removes Nilana-only configuration files that did not previously exist, reapplies sysctl settings, and reloads/restarts affected services where safe. It deliberately does not purge Ubuntu packages, alter firewall rules, remove OpenSSH, or change Oracle Cloud VCN rules. Review and purge packages manually only if they were installed for Nilana and are not needed elsewhere.
+
 ## Oracle Cloud networking
 
 Add only the ingress rules you need to the VCN security list or network security group. SSH/Dropbear/Stunnel ports may need inbound TCP rules (22, 442, 555, 443, 445). If you explicitly configured a trusted CIDR, proxy access should be limited to that source on TCP 3128, 8000, and 8080; BadVPN should likewise be limited to the trusted source on TCP 7300. The instance firewall must also permit the intended connections. This script deliberately does not rewrite firewall policy.

@@ -12,6 +12,85 @@ backup_once() {
   fi
 }
 
+uninstall_nilana() {
+  log 'Removing Nilana VPS customizations and restoring saved configuration'
+
+  for unit in nilana-badvpn.service; do
+    systemctl disable --now "$unit" 2>/dev/null || true
+  done
+
+  # Restore pre-install versions where available; otherwise remove only files
+  # created/managed by Nilana. OpenSSH itself is intentionally not removed.
+  local file
+  for file in \
+    /etc/issue.net \
+    /etc/ssh/sshd_config.d/00-nilana.conf \
+    /etc/ssh/sshd_config \
+    /etc/default/dropbear \
+    /etc/stunnel/stunnel.conf \
+    /etc/default/stunnel4 \
+    /etc/squid/squid.conf \
+    /etc/fail2ban/jail.d/nilana.local \
+    /etc/sysctl.d/99-nilana-network.conf; do
+    if [[ -e "${file}.nilana.bak" ]]; then
+      mv -f -- "${file}.nilana.bak" "$file"
+      log "Restored $file"
+    else
+      case "$file" in
+        /etc/issue.net|/etc/ssh/sshd_config.d/00-nilana.conf|/etc/fail2ban/jail.d/nilana.local|/etc/sysctl.d/99-nilana-network.conf)
+          rm -f -- "$file"
+          log "Removed $file"
+          ;;
+      esac
+    fi
+  done
+
+  rm -f /etc/systemd/system/nilana-badvpn.service \
+    /usr/local/sbin/nilana-udpgw \
+    /etc/stunnel/nilana.pem /etc/stunnel/nilana.key /etc/stunnel/nilana.crt
+  systemctl daemon-reload
+
+  # Apply restored network settings and restart only services whose config is valid.
+  sysctl --system >/dev/null 2>&1 || true
+  if command -v sshd >/dev/null 2>&1 && sshd -t; then
+    systemctl reload ssh 2>/dev/null || systemctl try-restart ssh 2>/dev/null || true
+  else
+    log 'Warning: SSH config test failed; leaving the SSH daemon untouched.'
+  fi
+  systemctl try-restart dropbear stunnel4 squid fail2ban 2>/dev/null || true
+
+  cat <<'UNINSTALL_DONE'
+
+Nilana VPS customizations have been removed.
+The installer does not purge Ubuntu packages (including OpenSSH, Dropbear,
+Stunnel, Squid, Fail2ban, or build tools), because some may have existed
+before installation or be used by other software. Review and remove packages
+manually only if you know they are not needed. Firewall rules are unchanged.
+UNINSTALL_DONE
+}
+
+if [[ ${1:-} == --uninstall ]]; then
+  [[ $EUID -eq 0 ]] || die 'Run with sudo or as root.'
+  if [[ ${2:-} != --yes ]]; then
+    [[ -t 0 ]] || die 'Non-interactive uninstall requires: --uninstall --yes'
+    read -r -p 'This restores/removes Nilana VPS configuration. Type UNINSTALL to continue: ' answer
+    [[ $answer == UNINSTALL ]] || die 'Uninstall cancelled.'
+  fi
+  uninstall_nilana
+  exit 0
+fi
+
+if [[ ${1:-} == --help ]]; then
+  cat <<'HELP'
+Usage:
+  sudo bash nilana-vps-installer.sh             Install/configure Nilana VPS
+  sudo bash nilana-vps-installer.sh --uninstall Remove Nilana customizations
+  sudo bash nilana-vps-installer.sh --uninstall --yes  Non-interactive uninstall
+HELP
+  exit 0
+fi
+
+[[ $# -eq 0 ]] || die 'Unknown argument. Use --help for usage.'
 [[ $EUID -eq 0 ]] || die 'Run with sudo or as root.'
 [[ -r /etc/os-release ]] || die 'Cannot identify operating system.'
 . /etc/os-release
@@ -58,6 +137,7 @@ cat >/etc/ssh/sshd_config.d/00-nilana.conf <<'SSHCONF'
 Port 22
 Banner /etc/issue.net
 SSHCONF
+backup_once /etc/ssh/sshd_config
 if ! grep -Eq '^[[:space:]]*Include[[:space:]].*sshd_config\.d' /etc/ssh/sshd_config; then
   # Ubuntu's stock config normally has Include already. If absent, insert it first
   # so the Nilana drop-in is read before other settings.
@@ -200,7 +280,7 @@ systemctl enable fail2ban
 systemctl restart fail2ban
 
 log 'Applying conservative, reversible BBR congestion-control setting when supported'
-if modprobe tcp_bbr 2>/dev/null && sysctl -a 2>/dev/null | grep -q 'net.ipv4.tcp_available_congestion_control.*bbr'; then
+if modprobe tcp_bbr 2>/dev/null && sysctl -a 2>/dev/null | grep 'net.ipv4.tcp_available_congestion_control' | grep -qw bbr; then
   backup_once /etc/sysctl.d/99-nilana-network.conf
   cat >/etc/sysctl.d/99-nilana-network.conf <<'SYSCTL'
 # BBR can improve throughput under some paths; it cannot reduce physical RTT.
