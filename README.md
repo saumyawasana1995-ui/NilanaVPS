@@ -14,18 +14,58 @@ custom server banner, account expiry and optional one-device-per-account limitin
 | Squid         | 3128, 8000, 8080 |
 | BadVPN-udpgw  | 7300 (127.0.0.1) |
 
-## Install
+## Installation commands
 
 Log in to the VPS and run as root (`sudo -i` first on Oracle's `ubuntu` user):
 
+### Full installer
+
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/Nilana-VPS/main/install.sh
+wget -O install.sh https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main/install.sh
 sudo bash install.sh
+```
+
+### Lite installer
+
+```bash
+wget -O install-lite.sh https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main/install-lite.sh
+sudo bash install-lite.sh
+```
+
+### VLESS installer
+
+```bash
+wget -O install-vless.sh https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main/install-vless.sh
+sudo bash install-vless.sh
 ```
 
 Options: `--lite` · `--full` · `--no-squid` · `-y` (no questions) · `--no-upgrade` (skip `apt upgrade`) · `--update` (update an existing install,
 keeps users/banner/settings) · `--reset-banner` · `--domain vpn.example.com` · `--no-reboot`.
 Everything is logged to `/var/log/nilana-install.log`. The installer is safe to re-run.
+
+## Uninstallation commands
+
+Open the management menu:
+
+```bash
+sudo menu
+```
+
+Then choose **20) Uninstall Script**. You must type `UNINSTALL` to confirm.
+
+You can also uninstall directly from the terminal:
+
+```bash
+sudo menu uninstall
+```
+
+To uninstall Nilana VLESS separately:
+
+```bash
+sudo vless uninstall
+```
+
+The uninstaller can optionally delete Nilana user accounts and remove the installed packages.
 
 ### Oracle Cloud: one manual step
 
@@ -44,7 +84,7 @@ No domain needed - everything works with the server IP. For small servers use **
 (same code as `install.sh`, with the Lite profile switched on):
 
 ```bash
-wget -O install-lite.sh https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/Nilana-VPS/main/install-lite.sh
+wget -O install-lite.sh https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main/install-lite.sh
 sudo bash install-lite.sh
 ```
 
@@ -105,7 +145,7 @@ Shortcuts: `menu update` · `menu uninstall` · `menu repair` · `menu domain` �
 * **Update Script** downloads `install.sh` from your GitHub, checks it, shows installed vs. available version and
   re-runs it in `--update` mode (your users, banner and settings are kept). Before publishing, set
   `UPDATE_URL_DEFAULT` near the top of `install.sh` to your raw URL
-  (`https://raw.githubusercontent.com/<user>/Nilana-VPS/main/install.sh`); otherwise the menu asks for it once.
+  (`https://raw.githubusercontent.com/saumyawasana1995-ui/NilanaVPS/main/install.sh`); otherwise the menu asks for it once.
   Only point it at a repository you control – the script runs as root.
 * **Uninstall Script** (type `UNINSTALL` to confirm) removes services, menu, firewall rules and settings, and
   restores the original SSH config, banner and Squid config. Optionally deletes all Nilana accounts and the
@@ -140,8 +180,8 @@ or DuckDNS, or your own domain with Cloudflare / registrar DNS.
 | Problem in the original | Fix |
 |---|---|
 | `apt-get install … python …` – package no longer exists on Ubuntu 20.04+, so the **whole** command failed | removed; Python 3 is used only where needed |
-| `systemd-sysv-install enable stunnel4` fails: Ubuntu 22.04/24.04 ship the stunnel4 init script in a *disabled* state | Nilana never enables the distro init script; it masks it and runs its own `nilana-stunnel.service` (set up by the standalone, re-runnable `nilana-stunnel-setup`). If the package's own post-install step aborts, it is repaired |
-| Stunnel not coming back after a reboot | unit has no start-rate limit and pre-start checks, boot-enable is verified (link created by hand if `systemctl enable` fails), firewall persistence is verified, Stunnel runs without a privilege-drop step |
+| `systemd-sysv-install enable stunnel4` fails: Ubuntu 22.04/24.04 ship the stunnel4 init script in a *disabled* state | Nilana never enables the distro init script; it masks it and runs its own unit |
+| Stunnel not coming back after a reboot | unit has no start-rate limit and pre-start checks, boot-enable is verified (link created by hand if `systemctl enable` fails), firewall persistence is verified |
 | `stunnel.conf` defined two sections both named `[dropbear]` | unique section names |
 | `squid.conf` used `hierarchy_stoplist` / `manager` (removed in Squid ≥ 4) → Squid would not start | clean config valid on Squid 4, 5 and 6 |
 | Squid ACL used `ifconfig` (not installed) → empty IP; and on Oracle the public IP is not on the NIC | public IP from the internet + private IP from `ip route`, both allowed |
