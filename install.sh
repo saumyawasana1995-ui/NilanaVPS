@@ -1,0 +1,1651 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  NILANA VPS  -  SSH / Dropbear / Stunnel (SSL) / Squid / BadVPN auto-installer
+#
+#  Supported : Ubuntu 20.04 / 22.04 / 24.04  (x86_64 and ARM64)
+#  Tuned for : Oracle Cloud "Always Free" VPS (AMD E2.1.Micro and Ampere A1)
+#
+#  Ports     : OpenSSH 22 | Dropbear 442 555 | Stunnel 443 445
+#              Squid 3128 8000 8080 | BadVPN-udpgw 7300
+#
+#  Based on "Debian_SSH_VPS_script" by Tharuka Sandaruwan (Apache-2.0), which
+#  itself derives from xiihaiqal/AutoScriptVPS. Licensed under Apache-2.0.
+#
+#  Usage     : sudo bash install.sh [-y|--yes] [--no-upgrade] [--update] [--reset-banner] [--domain NAME] [--no-reboot] [--lite|--full] [--no-squid] [-h|--help]
+# =============================================================================
+set -uo pipefail
+
+NILANA_VERSION="2.3.0"
+
+# ----------------------------------------------------------------- settings
+SSH_PORT=22
+DROPBEAR_PORTS=(442 555)
+STUNNEL_MAP=("443:442" "445:555")          # public-ssl-port:dropbear-port
+SQUID_PORTS=(3128 8000 8080)
+UDPGW_PORT=7300
+UDPGW_LISTEN="127.0.0.1"                   # use 0.0.0.0 only if you really want a public UDPGW
+TIMEZONE="${NILANA_TZ:-Asia/Colombo}"
+BADVPN_URLS=(
+  "https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz"
+  "https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/badvpn/badvpn-1.999.128.tar.bz2"
+)
+
+# Set this to the RAW url of install.sh in YOUR GitHub repo before you publish it, e.g.
+# https://raw.githubusercontent.com/<user>/Nilana-VPS/main/install.sh   (menu -> Update Script uses it)
+UPDATE_URL_DEFAULT=""
+
+ASSUME_YES=0
+DO_UPGRADE=1
+UPDATE_MODE=0
+RESET_BANNER=0
+DOMAIN_ARG=""
+ENABLE_REBOOT=1                            # nightly reboot at 00:00 (change/disable in the menu)
+REBOOT_TIME="00:00"
+LITE_DEFAULT=0                             # 1 = "Lite" profile for small servers (install-lite.sh sets this)
+LITE_FLAG=""; SQUID_FLAG=""
+LOG=/var/log/nilana-install.log
+FAILED=()
+
+# ------------------------------------------------------------------ output
+if [ -t 1 ]; then
+  R=$'\e[31;1m'; G=$'\e[32;1m'; Y=$'\e[33;1m'; B=$'\e[34;1m'; C=$'\e[36;1m'; N=$'\e[0m'
+else
+  R=''; G=''; Y=''; B=''; C=''; N=''
+fi
+step() { printf '\n%s==>%s %s%s%s\n' "$C" "$N" "$G" "$*" "$N"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '    %s[ OK ]%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '    %s[WARN]%s %s\n' "$Y" "$N" "$*"; }
+fail() { printf '    %s[FAIL]%s %s\n' "$R" "$N" "$*"; FAILED+=("$*"); }
+TEE_PID=""
+finish() {   # flush the log pipe, then exit with the given code
+  local rc=${1:-0}
+  if [ -n "$TEE_PID" ]; then exec >&- 2>&-; wait "$TEE_PID" 2>/dev/null; fi
+  exit "$rc"
+}
+die()  { printf '\n%s[ERROR]%s %s\n' "$R" "$N" "$*" >&2; finish 1; }
+
+logo() {
+  printf '%s' "$C"
+  cat <<'EOF'
+ _  _ ___ _      _   _  _   _    __   _____  ___
+| \| |_ _| |    /_\ | \| | /_\   \ \ / / _ \/ __|
+| .` || || |__ / _ \| .` |/ _ \   \ V /|  _/\__ \
+|_|\_|___|____/_/ \_\_|\_/_/ \_\   \_/ |_|  |___/
+EOF
+  printf '%s' "$N"
+  printf '%s      Fast  *  Secure  *  Stable  SSH Tunnel   v%s%s%s\n\n' "$Y" "$NILANA_VERSION" "${LITE_TAG:-}" "$N"
+}
+
+usage() {
+  cat <<EOF
+Nilana VPS installer v$NILANA_VERSION
+
+  sudo bash install.sh [options]
+
+  -y, --yes        do not ask for confirmation
+  --no-upgrade     skip "apt-get upgrade" (faster, but not recommended)
+  --update         update an existing install (keeps users, banner and settings)
+  --reset-banner   overwrite your banner with the default Nilana banner
+  --domain NAME    domain that points (A record, DNS-only) to this VPS
+  --no-reboot      do not enable the nightly reboot (can be enabled later in the menu)
+  --lite           Lite profile for low RAM/CPU: swap file, no apt upgrade, build tools removed again,
+                   unused system services off, small journal, no domain/speedtest extras
+  --full           force the full profile
+  --no-squid       do not install Squid (saves ~26 MB RAM and ports 3128/8000/8080)
+  --with-squid     install Squid (default)
+  -h, --help       show this help
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -y|--yes) ASSUME_YES=1 ;;
+    --no-upgrade) DO_UPGRADE=0 ;;
+    --update) UPDATE_MODE=1; ASSUME_YES=1; DO_UPGRADE=0 ;;
+    --reset-banner) RESET_BANNER=1 ;;
+    --no-reboot) ENABLE_REBOOT=0 ;;
+    --lite) LITE_FLAG=1 ;;
+    --full) LITE_FLAG=0 ;;
+    --no-squid) SQUID_FLAG=0 ;;
+    --with-squid) SQUID_FLAG=1 ;;
+    --domain) shift; DOMAIN_ARG=${1:-} ;;
+    --domain=*) DOMAIN_ARG=${1#--domain=} ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+  shift
+done
+
+# profile: flag > what the existing install uses > built-in default
+OLD_PROFILE=$( ( . /etc/nilana/server.conf 2>/dev/null; echo "${PROFILE:-}" ) )
+OLD_SQUID=$( ( . /etc/nilana/server.conf 2>/dev/null; echo "${SQUID_ENABLED:-}" ) )
+if [ -n "$LITE_FLAG" ]; then LITE=$LITE_FLAG
+elif [ "$LITE_DEFAULT" -eq 1 ]; then LITE=1            # install-lite.sh always installs Lite
+elif [ -n "$OLD_PROFILE" ]; then [ "$OLD_PROFILE" = lite ] && LITE=1 || LITE=0
+else LITE=0; fi
+if [ -n "$SQUID_FLAG" ]; then SQUID_ON=$SQUID_FLAG; elif [ -n "$OLD_SQUID" ]; then SQUID_ON=$OLD_SQUID; else SQUID_ON=1; fi
+[ "$SQUID_ON" -eq 1 ] || SQUID_PORTS=()
+LITE_TAG=""; LIMIT_EVERY=10
+if [ "$LITE" -eq 1 ]; then LITE_TAG="  LITE"; LIMIT_EVERY=30; DO_UPGRADE=0; fi
+PROFILE=full; [ "$LITE" -eq 1 ] && PROFILE=lite
+
+# --------------------------------------------------------------- pre-flight
+[ "$(id -u)" -eq 0 ] || die "Please run as root:  sudo bash install.sh"
+mkdir -p "$(dirname "$LOG")"; exec > >(tee -a "$LOG") 2>&1; TEE_PID=$!
+
+clear 2>/dev/null || true
+logo
+
+# shellcheck disable=SC1091
+. /etc/os-release 2>/dev/null || die "Cannot read /etc/os-release"
+case "${ID:-}:${VERSION_ID:-}" in
+  ubuntu:20.04|ubuntu:22.04|ubuntu:24.04) ;;
+  ubuntu:*|debian:*) warn "Untested release ${PRETTY_NAME:-?}: designed for Ubuntu 20.04 - 24.04. Continuing anyway." ;;
+  *) die "Unsupported OS (${PRETTY_NAME:-unknown}). Use Ubuntu 20.04, 22.04 or 24.04." ;;
+esac
+[ -d /run/systemd/system ] || die "systemd is required (containers / WSL are not supported)."
+info "OS: ${PRETTY_NAME:-$ID $VERSION_ID}   Arch: $(uname -m)   Kernel: $(uname -r)"
+
+if [ "$ASSUME_YES" -ne 1 ] && [ -t 0 ]; then
+  echo
+  read -rp "Install Nilana VPS now? [Y/n] " ans
+  [[ ${ans:-y} =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+fi
+
+# ------------------------------------------------------ low-RAM protection
+if [ "$LITE" -eq 1 ]; then
+  step "Low-RAM protection (swap file)"
+  mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  swap_mb=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
+  free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  if [ "$swap_mb" -gt 0 ]; then ok "swap already present (${swap_mb} MB)"
+  elif [ "$mem_mb" -ge 1900 ]; then info "RAM is ${mem_mb} MB - swap not needed"
+  elif [ "$free_mb" -lt 3000 ]; then warn "only ${free_mb} MB disk free - swap file skipped"
+  else
+    rm -f /swapfile
+    mk_swap() { chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; }
+    if { fallocate -l 1024M /swapfile 2>/dev/null && mk_swap; } \
+       || { rm -f /swapfile; dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null && mk_swap; }; then
+      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+      echo 'vm.swappiness = 10' >/etc/sysctl.d/98-nilana-swap.conf; sysctl -q -p /etc/sysctl.d/98-nilana-swap.conf >/dev/null 2>&1
+      ok "1 GB swap file enabled (RAM ${mem_mb} MB)"
+    else
+      rm -f /swapfile; warn "could not create a swap file - continuing without"
+    fi
+  fi
+fi
+
+# --------------------------------------------------------------------- apt
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+APT_OPTS=(-y -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+apt_get() { apt-get "${APT_OPTS[@]}" "$@"; }
+
+# Never let package postinst scripts start half-configured daemons.
+POLICY=/usr/sbin/policy-rc.d; POLICY_MADE=0
+block_services() {
+  if [ ! -e "$POLICY" ]; then printf '#!/bin/sh\nexit 101\n' >"$POLICY"; chmod +x "$POLICY"; POLICY_MADE=1; fi
+}
+allow_services() { [ "$POLICY_MADE" = 1 ] && rm -f "$POLICY"; POLICY_MADE=0; }
+trap allow_services EXIT
+
+step "Updating package lists"
+block_services
+apt_get update || apt_get -o Acquire::ForceIPv4=true update || warn "apt update reported errors"
+if [ "$DO_UPGRADE" -eq 1 ]; then
+  step "Upgrading installed packages (this can take a few minutes)"
+  apt_get upgrade || warn "apt upgrade reported errors"
+fi
+
+step "Installing base tools"
+apt_get install ca-certificates curl wget openssl iproute2 procps psmisc python3 nano htop iptables \
+  || die "Could not install base packages. Check your internet / apt sources."
+if [ "$LITE" -eq 0 ]; then
+  apt_get install speedtest-cli >/dev/null 2>&1 || warn "speedtest-cli not available (menu speedtest disabled)"
+fi
+
+# ------------------------------------------------------------- IP detection
+step "Detecting server addresses"
+PUBIP=""
+for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com https://checkip.amazonaws.com; do
+  PUBIP=$(curl -4fsS --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]')
+  [[ $PUBIP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+  PUBIP=""
+done
+PRIVIP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+[ -n "$PUBIP" ] || { PUBIP=$PRIVIP; warn "Could not detect the public IP - using $PRIVIP. Fix later with: menu -> Update Server IP"; }
+[ -n "$PUBIP" ] || die "No IPv4 address found."
+ok "Public IP: $PUBIP   Private IP: ${PRIVIP:-n/a}"
+
+# domain (optional): flag/env > previous install > prompt
+OLD_DOMAIN=$( ( . /etc/nilana/server.conf 2>/dev/null; echo "${DOMAIN:-}" ) )
+DOMAIN=${DOMAIN_ARG:-${NILANA_DOMAIN:-$OLD_DOMAIN}}
+if [ -z "$DOMAIN" ] && [ "$LITE" -eq 0 ] && [ "$ASSUME_YES" -ne 1 ] && [ -t 0 ]; then
+  echo; read -rp "Domain that points to this VPS (optional, Enter to skip): " DOMAIN
+fi
+DOMAIN=$(printf '%s' "$DOMAIN" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+if [ -n "$DOMAIN" ] && ! [[ $DOMAIN =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+  warn "'$DOMAIN' is not a valid domain name - ignored"; DOMAIN=""
+fi
+if [ -n "$DOMAIN" ]; then
+  DOMIP=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
+  if [ "$DOMIP" = "$PUBIP" ]; then ok "Domain $DOMAIN -> $DOMIP (matches this server)"
+  else warn "Domain $DOMAIN currently resolves to '${DOMIP:-nothing}', not $PUBIP. Fix the A record (DNS only / grey cloud)."; fi
+fi
+
+# remember the update url of an existing install
+OLD_UPDATE_URL=$( ( . /etc/nilana/server.conf 2>/dev/null; echo "${UPDATE_URL:-}" ) )
+UPDATE_URL=${NILANA_UPDATE_URL:-${OLD_UPDATE_URL:-$UPDATE_URL_DEFAULT}}
+mkdir -p /etc/nilana
+STUNNEL_PORT_LIST=""; for m in "${STUNNEL_MAP[@]}"; do STUNNEL_PORT_LIST+="${m%%:*} "; done
+STUNNEL_PORT_LIST=${STUNNEL_PORT_LIST% }
+cat >/etc/nilana/server.conf <<CONFEOF
+# Nilana VPS settings (read by the menu)
+VERSION=$NILANA_VERSION
+PUBIP=$PUBIP
+PRIVIP=$PRIVIP
+SSH_PORT=$SSH_PORT
+DROPBEAR_PORTS="${DROPBEAR_PORTS[*]}"
+STUNNEL_PORTS="$STUNNEL_PORT_LIST"
+SQUID_PORTS="${SQUID_PORTS[*]}"
+UDPGW_PORT=$UDPGW_PORT
+UPDATE_URL="$UPDATE_URL"
+DOMAIN="$DOMAIN"
+PROFILE=$PROFILE
+SQUID_ENABLED=$SQUID_ON
+CONFEOF
+
+# ---------------------------------------------------------- time / sysctl
+step "System tuning"
+if timedatectl set-timezone "$TIMEZONE" 2>/dev/null || ln -fs "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; then
+  ok "Timezone: $TIMEZONE"
+fi
+modprobe tcp_bbr 2>/dev/null || true
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+  cat >/etc/sysctl.d/99-nilana.conf <<'EOF'
+# Nilana VPS network tuning
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+  sysctl -q -p /etc/sysctl.d/99-nilana.conf >/dev/null 2>&1 && ok "TCP BBR enabled"
+else
+  info "BBR not available on this kernel - skipped"
+fi
+
+if [ "$LITE" -eq 1 ]; then
+  step "Lite tuning (small journal, unused services off)"
+  mkdir -p /etc/systemd/journald.conf.d
+  printf '[Journal]\nSystemMaxUse=50M\nRuntimeMaxUse=20M\nMaxRetentionSec=1week\n' >/etc/systemd/journald.conf.d/nilana.conf
+  systemctl restart systemd-journald >/dev/null 2>&1 && ok "journal limited to 50 MB"
+  for u in ModemManager.service udisks2.service packagekit.service fwupd.service fwupd-refresh.timer motd-news.timer; do
+    if systemctl list-unit-files "$u" 2>/dev/null | grep -q "^$u"; then
+      systemctl mask --now "$u" >/dev/null 2>&1 && info "turned off $u (undo: systemctl unmask $u)"
+    fi
+  done
+fi
+
+mkdir -p /etc/nilana
+
+# ------------------------------------------------------------------ banner
+step "Installing server banner"
+if [ ! -f /etc/nilana/banner.html ] || [ "$RESET_BANNER" -eq 1 ]; then
+cat >/etc/nilana/banner.html <<'__NILANA_BANNER_HTML__'
+<p style="text-align:center"><span style="color:#00e5ff"><b>&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;</b></span></p>
+<h1 style="text-align:center"><span style="color:#00e5ff"><b>&#9700; NILANA VPS &#9699;</b></span></h1>
+<p style="text-align:center"><span style="color:#ffd600"><b>Fast &bull; Secure &bull; Stable</b></span></p>
+<p style="text-align:center"><span style="color:#00ff88"><b>WELCOME!</b></span></p>
+<p style="text-align:center"><span style="color:#ff4081">&#10004; Gaming &amp; VoIP supported (UDPGW 7300)</span></p>
+<p style="text-align:center"><span style="color:#ff4081">&#10004; High speed SSH / SSL / Proxy tunnel</span></p>
+<p style="text-align:center"><span style="color:#ff1744"><b>RULES</b></span></p>
+<p style="text-align:center"><span style="color:#ffffff">&#10008; No DDoS &bull; No hacking &bull; No spamming</span></p>
+<p style="text-align:center"><span style="color:#ffffff">&#10008; No torrent &bull; No illegal activity</span></p>
+<p style="text-align:center"><span style="color:#b388ff">Abuse = account banned without notice</span></p>
+<p style="text-align:center"><span style="color:#00e5ff"><b>&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;&#9473;</b></span></p>
+<p style="text-align:center"><span style="color:#00ff88">Powered by <b>Nilana VPS</b></span></p>
+__NILANA_BANNER_HTML__
+cat >/etc/nilana/banner.txt <<'__NILANA_BANNER_TXT__'
+
+  ================================================
+              N I L A N A    V P S
+          Fast  *  Secure  *  Stable  Tunnel
+  ================================================
+   [+] Gaming & VoIP supported (UDPGW 7300)
+   [+] High speed SSH / SSL / Proxy tunnel
+  ------------------------------------------------
+   [-] No DDoS, hacking or spamming
+   [-] No torrent or illegal activity
+       Abuse = account banned without notice
+  ================================================
+__NILANA_BANNER_TXT__
+[ -f /etc/nilana/issue.net.orig ] || { [ -f /etc/issue.net ] && cp /etc/issue.net /etc/nilana/issue.net.orig; }
+cp /etc/nilana/banner.html /etc/issue.net
+ok "Banner installed (/etc/issue.net, $(wc -c </etc/issue.net) bytes)"
+else
+  ok "Existing banner kept (use --reset-banner to restore the default)"
+fi
+
+# ----------------------------------------------------------------- OpenSSH
+step "Configuring OpenSSH (port $SSH_PORT)"
+command -v sshd >/dev/null 2>&1 || apt_get install openssh-server || fail "openssh-server missing"
+mkdir -p /etc/ssh/sshd_config.d
+if ! grep -Eiq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+  sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+fi
+cat >/etc/ssh/sshd_config.d/00-nilana.conf <<'EOF'
+# Nilana VPS  (read before every other file, first value wins)
+Banner /etc/issue.net
+PasswordAuthentication yes
+AllowTcpForwarding yes
+GatewayPorts no
+ClientAliveInterval 30
+ClientAliveCountMax 4
+MaxStartups 50:30:200
+MaxSessions 200
+UseDNS no
+EOF
+mkdir -p /run/sshd
+if sshd -t 2>/tmp/nilana-sshd-test; then
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+  ok "OpenSSH reloaded (password login + banner enabled)"
+else
+  rm -f /etc/ssh/sshd_config.d/00-nilana.conf
+  fail "sshd config test failed - changes reverted: $(head -n1 /tmp/nilana-sshd-test)"
+fi
+# login shells that Dropbear/OpenSSH accept for tunnel-only accounts
+for sh in /bin/false /usr/sbin/nologin; do grep -qxF "$sh" /etc/shells || echo "$sh" >>/etc/shells; done
+
+# ---------------------------------------------------------------- Dropbear
+step "Installing Dropbear (ports ${DROPBEAR_PORTS[*]})"
+apt_get install dropbear-bin || fail "dropbear-bin could not be installed"
+DROPBEAR_BIN=$(command -v dropbear || true); [ -x "${DROPBEAR_BIN:-}" ] || DROPBEAR_BIN=/usr/sbin/dropbear
+mkdir -p /etc/dropbear
+genkey() { [ -s "$2" ] || dropbearkey -t "$1" ${3:+-s "$3"} -f "$2" >/dev/null 2>&1; }
+genkey rsa     /etc/dropbear/dropbear_rsa_host_key     2048
+genkey ecdsa   /etc/dropbear/dropbear_ecdsa_host_key   256
+genkey ed25519 /etc/dropbear/dropbear_ed25519_host_key ""
+DB_ARGS=""; for p in "${DROPBEAR_PORTS[@]}"; do DB_ARGS+=" -p $p"; done
+# the distro "dropbear" init script/service must not fight with ours
+systemctl stop dropbear.service 2>/dev/null; systemctl mask dropbear.service >/dev/null 2>&1
+cat >/etc/systemd/system/nilana-dropbear.service <<EOF
+[Unit]
+Description=Nilana VPS - Dropbear SSH (ports ${DROPBEAR_PORTS[*]})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$DROPBEAR_BIN -F -E -w -K 30$DB_ARGS -b /etc/issue.net
+Restart=always
+RestartSec=2
+# restarting the service must not disconnect users that are already online
+KillMode=process
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ok "Dropbear service written"
+
+# ----------------------------------------------------------------- Stunnel
+step "Installing Stunnel / SSL (ports $STUNNEL_PORT_LIST)"
+cat >/usr/local/sbin/nilana-stunnel-setup.new <<'__NILANA_STUNNEL__'
+#!/usr/bin/env bash
+# Nilana VPS - (re)creates the Stunnel SSL service from scratch.
+# Safe to run at any time:   nilana-stunnel-setup            (repair + restart)
+#                            nilana-stunnel-setup --no-start (used by the installer)
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "Please run as root."; exit 1; }
+
+NO_START=0; [ "${1:-}" = "--no-start" ] && NO_START=1
+CONF=/etc/nilana/server.conf
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+read -r -a SSL_PORTS <<<"${STUNNEL_PORTS:-443 445}"
+read -r -a DB_PORTS  <<<"${DROPBEAR_PORTS:-442 555}"
+UNIT=/etc/systemd/system/nilana-stunnel.service
+PEM=/etc/stunnel/nilana.pem
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+
+say()  { printf '  %s\n' "$*"; }
+oops() { printf '  [FAIL] %s\n' "$*"; }
+
+# ---- 1. package (with repair of the update-rc.d / systemd-sysv-install problem)
+STUNNEL_BIN=$(command -v stunnel4 || true)
+if [ -z "$STUNNEL_BIN" ]; then
+  say "installing stunnel4 ..."
+  made=0
+  if [ ! -e /usr/sbin/policy-rc.d ]; then printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d; made=1; fi
+  APT=(-y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  if ! apt-get "${APT[@]}" install stunnel4; then
+    say "package post-install failed - repairing (known update-rc.d problem on Ubuntu 22.04/24.04)"
+    shim=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' >"$shim/update-rc.d"; chmod +x "$shim/update-rc.d"
+    PATH="$shim:$PATH" dpkg --configure -a
+    PATH="$shim:$PATH" apt-get "${APT[@]}" -f install
+    rm -rf "$shim"
+  fi
+  [ "$made" = 1 ] && rm -f /usr/sbin/policy-rc.d
+  STUNNEL_BIN=$(command -v stunnel4 || true)
+fi
+[ -x "${STUNNEL_BIN:-}" ] || { oops "stunnel4 is not installed (check your internet / apt)"; exit 1; }
+
+# ---- 2. the distro init service must never run (it fights for the ports and
+#         is the one that triggers the systemd-sysv-install error)
+systemctl stop stunnel4.service >/dev/null 2>&1
+systemctl mask stunnel4.service >/dev/null 2>&1
+[ -f /etc/default/stunnel4 ] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/stunnel4
+
+# ---- 3. certificate (key + cert in one file; CN/SAN follow the domain when one is set)
+WANT_CN=${DOMAIN:-nilana-vps}
+HAVE_CN=$(openssl x509 -in "$PEM" -noout -subject -nameopt multiline 2>/dev/null | awk -F' = ' '/commonName/{print $2; exit}')
+if ! openssl x509 -in "$PEM" -noout >/dev/null 2>&1 || ! openssl pkey -in "$PEM" -noout >/dev/null 2>&1 || [ "$HAVE_CN" != "$WANT_CN" ]; then
+  say "creating TLS certificate for $WANT_CN ..."
+  mkdir -p /etc/stunnel; k=$(mktemp); c=$(mktemp)
+  san="subjectAltName=DNS:$WANT_CN"
+  if openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+       -subj "/C=LK/O=Nilana VPS/CN=$WANT_CN" -addext "$san" -keyout "$k" -out "$c" >/dev/null 2>&1; then
+    ( umask 077; cat "$k" "$c" >"$PEM" )
+  else oops "openssl could not create the certificate"; rm -f "$k" "$c"; exit 1; fi
+  rm -f "$k" "$c"
+fi
+chmod 600 "$PEM"
+
+# ---- 4. stunnel configuration (runs as root: no privilege-drop edge cases)
+mkdir -p /etc/nilana
+{
+  echo "# Nilana VPS - Stunnel: TLS in front of Dropbear   (generated by nilana-stunnel-setup)"
+  echo "foreground = yes"
+  echo "cert = $PEM"
+  echo "client = no"
+  echo "debug = 4"
+  echo "socket = a:SO_REUSEADDR=1"
+  echo "socket = l:TCP_NODELAY=1"
+  echo "socket = r:TCP_NODELAY=1"
+  for i in "${!SSL_PORTS[@]}"; do
+    echo; echo "[nilana-ssl-${SSL_PORTS[$i]}]"
+    echo "accept = ${SSL_PORTS[$i]}"
+    echo "connect = 127.0.0.1:${DB_PORTS[$i]:-${DB_PORTS[0]}}"
+  done
+} >/etc/nilana/stunnel.conf
+
+# ---- 5. systemd unit (never gives up, survives reboots)
+cat >"$UNIT" <<EOF
+[Unit]
+Description=Nilana VPS - Stunnel SSL (${SSL_PORTS[*]})
+After=network-online.target nilana-dropbear.service
+Wants=network-online.target nilana-dropbear.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/test -s $PEM
+ExecStartPre=/usr/bin/test -s /etc/nilana/stunnel.conf
+ExecStart=$STUNNEL_BIN /etc/nilana/stunnel.conf
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ---- 6. enable for boot - and PROVE it
+systemctl daemon-reload
+systemctl enable nilana-stunnel.service >/dev/null 2>&1
+if ! systemctl is-enabled --quiet nilana-stunnel.service 2>/dev/null; then
+  mkdir -p /etc/systemd/system/multi-user.target.wants
+  ln -sf "$UNIT" /etc/systemd/system/multi-user.target.wants/nilana-stunnel.service
+  systemctl daemon-reload
+fi
+if systemctl is-enabled --quiet nilana-stunnel.service 2>/dev/null; then say "[ OK ] enabled at boot"; else oops "could not enable at boot"; fi
+
+[ "$NO_START" = 1 ] && { say "[ OK ] stunnel service written"; exit 0; }
+
+# ---- 7. start and verify
+systemctl restart nilana-stunnel.service
+sleep 3
+rc=0
+if systemctl is-active --quiet nilana-stunnel.service; then say "[ OK ] nilana-stunnel is running"; else oops "nilana-stunnel is NOT running"; rc=1; fi
+for p in "${SSL_PORTS[@]}"; do
+  if ss -H -ltn "sport = :$p" 2>/dev/null | grep -q .; then say "[ OK ] listening on TCP $p"; else oops "nothing listens on TCP $p"; rc=1; fi
+done
+if [ "$rc" -ne 0 ]; then
+  echo; echo "  Last log lines (journalctl -u nilana-stunnel):"
+  journalctl -u nilana-stunnel -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+fi
+exit "$rc"
+__NILANA_STUNNEL__
+chmod 755 /usr/local/sbin/nilana-stunnel-setup.new && mv -f /usr/local/sbin/nilana-stunnel-setup.new /usr/local/sbin/nilana-stunnel-setup
+/usr/local/sbin/nilana-stunnel-setup --no-start || fail "stunnel setup failed (repair later with: menu -> Repair Stunnel)"
+
+# ------------------------------------------------------------------- Squid
+if [ "$SQUID_ON" -eq 1 ]; then
+step "Installing Squid proxy (ports ${SQUID_PORTS[*]})"
+apt_get install squid || fail "squid could not be installed"
+[ -f /etc/squid/squid.conf.orig ] || { [ -f /etc/squid/squid.conf ] && cp /etc/squid/squid.conf /etc/squid/squid.conf.orig; }
+{
+  echo "# generated by Nilana VPS - do not edit (use menu: Update Server IP)"
+  echo "acl nilana_self dst 127.0.0.1/32"
+  [ -n "$PRIVIP" ] && [ "$PRIVIP" != "$PUBIP" ] && echo "acl nilana_self dst $PRIVIP/32"
+  echo "acl nilana_self dst $PUBIP/32"
+} >/etc/squid/nilana-dst.conf
+{
+  echo "# Nilana VPS - Squid (HTTP CONNECT gateway to this server only)"
+  for p in "${SQUID_PORTS[@]}"; do echo "http_port $p"; done
+  cat <<'EOF'
+
+include /etc/squid/nilana-dst.conf
+
+# Only allow tunnels that end on this very server (SSH / Dropbear / Stunnel ...)
+http_access allow nilana_self
+http_access deny all
+
+forwarded_for delete
+cache deny all
+cache_mem 8 MB
+access_log none
+shutdown_lifetime 3 seconds
+visible_hostname NilanaVPS
+coredump_dir /var/spool/squid
+EOF
+} >/etc/squid/squid.conf
+if squid -k parse >/tmp/nilana-squid-parse 2>&1 || grep -qi 'completed' /tmp/nilana-squid-parse; then
+  ok "Squid configuration is valid"
+else
+  fail "Squid config check failed: $(grep -iE 'error|fatal' /tmp/nilana-squid-parse | head -n2 | tr '\n' ' ')"
+fi
+else
+  step "Squid skipped (not requested)"
+  if systemctl cat squid >/dev/null 2>&1; then systemctl disable --now squid >/dev/null 2>&1 && info "existing Squid service turned off"; fi
+fi
+SVC_UNITS=(nilana-dropbear nilana-stunnel nilana-badvpn)
+[ "$SQUID_ON" -eq 1 ] && SVC_UNITS=(nilana-dropbear nilana-stunnel squid nilana-badvpn)
+
+# ------------------------------------------------------------------ BadVPN
+step "Building BadVPN-udpgw (port $UDPGW_PORT)"
+install_badvpn() {
+  [ -x /usr/local/bin/badvpn-udpgw ] && { ok "badvpn-udpgw already installed"; return 0; }
+  local newpk=() pk
+  for pk in build-essential cmake; do dpkg -s "$pk" >/dev/null 2>&1 || newpk+=("$pk"); done
+  apt_get install build-essential cmake || { warn "build tools missing"; return 1; }
+  local work here tarball="" f url
+  work=$(mktemp -d)
+  here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
+  for f in "$here"/badvpn/badvpn-*.tar.*; do [ -f "$f" ] && { tarball=$f; break; }; done
+  if [ -z "$tarball" ]; then
+    for url in "${BADVPN_URLS[@]}"; do
+      if curl -fsSL --retry 3 --max-time 120 -o "$work/badvpn.tar" "$url" && tar -tf "$work/badvpn.tar" >/dev/null 2>&1; then
+        tarball="$work/badvpn.tar"; break
+      fi
+    done
+  fi
+  [ -n "$tarball" ] || { warn "could not obtain BadVPN sources"; rm -rf "$work"; return 1; }
+  mkdir -p "$work/src" "$work/build"
+  tar -xf "$tarball" -C "$work/src" --strip-components=1 || { rm -rf "$work"; return 1; }
+  ( cd "$work/build" \
+    && cmake "$work/src" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null 2>&1 \
+    && make -j2 >/dev/null 2>&1 && make install >/dev/null 2>&1 ) || { rm -rf "$work"; return 1; }
+  rm -rf "$work"
+  if [ "$LITE" -eq 1 ] && [ ${#newpk[@]} -gt 0 ] && [ -x /usr/local/bin/badvpn-udpgw ]; then
+    apt_get purge "${newpk[@]}" >/dev/null 2>&1; apt_get autoremove --purge >/dev/null 2>&1
+    info "build tools removed again (saves disk space)"
+  fi
+  [ -x /usr/local/bin/badvpn-udpgw ]
+}
+if install_badvpn; then
+  pkill -x badvpn-udpgw 2>/dev/null   # leftovers from the old rc.local based script
+  cat >/etc/systemd/system/nilana-badvpn.service <<EOF
+[Unit]
+Description=Nilana VPS - BadVPN UDP gateway (${UDPGW_LISTEN}:${UDPGW_PORT})
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr ${UDPGW_LISTEN}:${UDPGW_PORT} --max-clients 1000 --max-connections-for-client 20 --client-socket-sndbuf 1048576 --loglevel warning
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  ok "BadVPN service written"
+else
+  fail "BadVPN-udpgw could not be built"
+fi
+
+# --------------------------------------------------------- tools and menu
+step "Installing management menu"
+cat >/usr/local/sbin/nilana-online.new <<'__NILANA_ONLINE__'
+#!/usr/bin/env python3
+"""
+Nilana VPS - session tool
+
+  nilana-online                 show online users (OpenSSH + Dropbear)
+  nilana-online --kick-extra    keep only the newest session of every Nilana user
+  nilana-online --kick-user U   disconnect every session of user U
+  nilana-online --expire        lock expired Nilana accounts and disconnect them
+
+"Nilana users" are the accounts created by the menu (GECOS field = NilanaVPS).
+Admin accounts such as ubuntu/opc are never touched.
+"""
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+MARK = "NilanaVPS"
+RUN_DIR = "/run/nilana"
+STATE = RUN_DIR + "/dropbear-map.json"
+CURSOR = RUN_DIR + "/dropbear.cursor"
+LOCK = RUN_DIR + "/lock"
+DROPBEAR_UNIT = "nilana-dropbear.service"
+SSH_PORTS = {"22"}
+DB_PORTS = {"442", "555"}
+
+# optional overrides from /etc/nilana/server.conf
+try:
+    with open("/etc/nilana/server.conf") as fh:
+        for line in fh:
+            m = re.match(r'^(SSH_PORT|DROPBEAR_PORTS)="?([^"\n]*)"?$', line.strip())
+            if m:
+                ports = set(m.group(2).split())
+                if m.group(1) == "SSH_PORT":
+                    SSH_PORTS = ports or SSH_PORTS
+                else:
+                    DB_PORTS = ports or DB_PORTS
+except OSError:
+    pass
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def nilana_users():
+    users = set()
+    for line in run(["getent", "passwd"]).splitlines():
+        f = line.split(":")
+        if len(f) >= 5 and f[4].split(",")[0] == MARK:
+            users.add(f[0])
+    return users
+
+
+def shadow_entries():
+    out = {}
+    try:
+        with open("/etc/shadow") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split(":")
+                if len(f) >= 8:
+                    out[f[0]] = f
+    except OSError:
+        pass
+    return out
+
+
+def process_table():
+    """pid -> (etimes, user, args)"""
+    table = {}
+    for line in run(["ps", "-eo", "pid=,etimes=,user:32=,args="]).splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2], parts[3])
+    return table
+
+
+def clean_ip(addr):
+    ip = addr.rsplit(":", 1)[0].strip("[]")
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip
+
+
+def established(ports):
+    """yield (local_port, peer_ip, peer_port, [pids]) for established sockets"""
+    expr = "( " + " or ".join("sport = :%s" % p for p in sorted(ports)) + " )"
+    out = run(["ss", "-H", "-t", "-n", "-p", "state", "established"] + expr.split(" "))
+    for line in out.splitlines():
+        tok = line.split()
+        if len(tok) < 4:
+            continue
+        local, peer = tok[2], tok[3]
+        pids = [int(x) for x in re.findall(r"pid=(\d+)", line)]
+        yield local.rsplit(":", 1)[1], clean_ip(peer), peer.rsplit(":", 1)[1], pids
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            return {int(k): v for k, v in json.load(fh).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def update_dropbear_map(alive_pids):
+    """Learn pid -> user from the dropbear journal (incrementally via a cursor)."""
+    os.makedirs(RUN_DIR, exist_ok=True)
+    state = load_state()
+    cmd = ["journalctl", "-u", DROPBEAR_UNIT, "-o", "json", "--no-pager",
+           "--cursor-file", CURSOR]
+    if not os.path.exists(CURSOR):
+        cmd += ["-n", "20000"]
+    rx = re.compile(r"auth succeeded for '([^']+)'")
+    for line in run(cmd).splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        msg = j.get("MESSAGE")
+        if not isinstance(msg, str):
+            continue
+        m = rx.search(msg)
+        if not m:
+            continue
+        pid = j.get("_PID")
+        if pid is None:
+            p = re.search(r"\[(\d+)\]", msg)
+            pid = p.group(1) if p else None
+        if pid is not None and str(pid).isdigit():
+            state[int(pid)] = m.group(1)
+    state = {p: u for p, u in state.items() if p in alive_pids}
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({str(k): v for k, v in state.items()}, fh)
+    os.replace(tmp, STATE)
+    return state
+
+
+def collect_sessions():
+    """list of dicts: user, service, ip, age, pid"""
+    procs = process_table()
+    sessions = []
+
+    # --- OpenSSH: one "[priv]" monitor process per authenticated connection
+    rx = re.compile(r"^sshd(?:-session)?: (\S+) \[priv\]")
+    for _, ip, _, pids in established(SSH_PORTS):
+        for pid in pids:
+            info = procs.get(pid)
+            if not info:
+                continue
+            m = rx.match(info[2])
+            if m and m.group(1) != "unknown":
+                sessions.append({"user": m.group(1), "service": "OpenSSH", "ip": ip,
+                                 "age": info[0], "pid": pid})
+                break
+
+    # --- Dropbear: one forked process per connection
+    db = []
+    for _, ip, _, pids in established(DB_PORTS):
+        for pid in pids:
+            info = procs.get(pid)
+            if info and "dropbear" in info[2]:
+                db.append((pid, ip, info[0]))
+                break
+    if db:
+        state = update_dropbear_map({p for p, _, _ in db})
+        for pid, ip, age in db:
+            user = state.get(pid)
+            if user:
+                sessions.append({"user": user, "service": "Dropbear", "ip": ip,
+                                 "age": age, "pid": pid})
+    return sessions
+
+
+def fmt_age(sec):
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return "%dd %02dh" % (d, h)
+    if h:
+        return "%dh %02dm" % (h, m)
+    return "%dm %02ds" % (m, s)
+
+
+def kill(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_show():
+    sessions = collect_sessions()
+    mine = nilana_users()
+    print("\033[36m%-4s %-16s %-9s %-18s %s\033[0m" % ("#", "USER", "SERVICE", "IP", "ONLINE"))
+    n = 0
+    for s in sorted(sessions, key=lambda x: (x["user"], x["age"])):
+        n += 1
+        tag = "" if s["user"] in mine else " *"
+        ip = s["ip"]
+        if ip in ("127.0.0.1", "::1"):
+            ip = "local (proxy)"
+        print("%-4d %-16s %-9s %-18s %s" % (n, s["user"] + tag, s["service"], ip, fmt_age(s["age"])))
+    print("\nTotal sessions: %d   (* = not a Nilana account)" % n)
+
+
+def cmd_kick_extra():
+    mine = nilana_users()
+    by_user = {}
+    for s in collect_sessions():
+        if s["user"] in mine:
+            by_user.setdefault(s["user"], []).append(s)
+    for user, lst in by_user.items():
+        if len(lst) < 2:
+            continue
+        lst.sort(key=lambda x: x["age"])       # newest first
+        for old in lst[1:]:
+            if kill(old["pid"]):
+                print("multi-login: disconnected %s (%s %s pid %d)" %
+                      (user, old["service"], old["ip"], old["pid"]))
+
+
+def kick_user(user):
+    n = 0
+    for s in collect_sessions():
+        if s["user"] == user and kill(s["pid"]):
+            n += 1
+    return n
+
+
+def cmd_expire():
+    today = int(time.time() // 86400)
+    shadow = shadow_entries()
+    for user in sorted(nilana_users()):
+        f = shadow.get(user)
+        if not f or not f[7].isdigit():
+            continue
+        if today > int(f[7]) and not f[1].startswith("!"):
+            subprocess.run(["usermod", "-L", user])
+            n = kick_user(user)
+            print("expired: locked %s (disconnected %d session(s))" % (user, n))
+
+
+def main():
+    os.makedirs(RUN_DIR, exist_ok=True)
+    lockfh = open(LOCK, "w")
+    fcntl.flock(lockfh, fcntl.LOCK_EX)
+    a = sys.argv[1:]
+    if not a:
+        cmd_show()
+    elif a[0] == "--kick-extra":
+        cmd_kick_extra()
+    elif a[0] == "--kick-user" and len(a) == 2:
+        print("disconnected %d session(s) of %s" % (kick_user(a[1]), a[1]))
+    elif a[0] == "--expire":
+        cmd_expire()
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    main()
+__NILANA_ONLINE__
+chmod 755 /usr/local/sbin/nilana-online.new && mv -f /usr/local/sbin/nilana-online.new /usr/local/sbin/nilana-online
+cat >/usr/local/bin/menu.new <<'__NILANA_MENU__'
+#!/usr/bin/env bash
+# Nilana VPS - management menu  (command: menu  |  nilana)
+
+[ "$(id -u)" -eq 0 ] || { echo "Please run as root:  sudo menu"; exit 1; }
+
+CONF=/etc/nilana/server.conf
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+PUBIP=${PUBIP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
+SSH_PORT=${SSH_PORT:-22}
+DROPBEAR_PORTS=${DROPBEAR_PORTS:-"442 555"}
+STUNNEL_PORTS=${STUNNEL_PORTS:-"443 445"}
+[ "$SQUID_ENABLED" = 1 ] && SQUID_PORTS=${SQUID_PORTS:-"3128 8000 8080"} || SQUID_PORTS=""
+UDPGW_PORT=${UDPGW_PORT:-7300}
+MARK="NilanaVPS"
+UPDATE_URL=${UPDATE_URL:-}
+DOMAIN=${DOMAIN:-}
+HOST=${DOMAIN:-$PUBIP}
+PROFILE=${PROFILE:-full}
+SQUID_ENABLED=${SQUID_ENABLED:-1}
+SERVICES="ssh nilana-dropbear nilana-stunnel squid nilana-badvpn"
+[ "$SQUID_ENABLED" = 1 ] || SERVICES="ssh nilana-dropbear nilana-stunnel nilana-badvpn"
+
+C0=$'\e[0m'; CR=$'\e[31;1m'; CG=$'\e[32;1m'; CY=$'\e[33;1m'; CC=$'\e[36;1m'; CBL=$'\e[34;1m'
+
+logo() {
+  printf '%s' "$CC"
+  cat <<'EOF'
+ _  _ ___ _      _   _  _   _    __   _____  ___
+| \| |_ _| |    /_\ | \| | /_\   \ \ / / _ \/ __|
+| .` || || |__ / _ \| .` |/ _ \   \ V /|  _/\__ \
+|_|\_|___|____/_/ \_\_|\_/_/ \_\   \_/ |_|  |___/
+EOF
+  printf '%s' "$C0"
+  printf '%s      Fast  *  Secure  *  Stable  SSH Tunnel%s%s\n' "$CY" "$([ "$PROFILE" = lite ] && echo '  LITE')" "$C0"
+}
+
+line() { printf '%s------------------------------------------------%s\n' "$CC" "$C0"; }
+pause() { echo; read -rp "Press Enter to return to the menu..." _; }
+ok()   { printf '%s%s%s\n' "$CG" "$*" "$C0"; }
+bad()  { printf '%s%s%s\n' "$CR" "$*" "$C0"; }
+
+# ---------------------------------------------------------------- helpers
+is_nilana_user() { [ "$(getent passwd "$1" | awk -F: '{split($5,a,","); print a[1]}')" = "$MARK" ]; }
+nilana_users()   { getent passwd | awk -F: -v m="$MARK" '{split($5,a,","); if (a[1]==m) print $1}' | sort; }
+
+# "30" -> today+30d ; "2026-12-31" -> that date ; prints YYYY-MM-DD
+calc_expiry() {
+  local in=$1
+  if [[ $in =~ ^[0-9]+$ ]]; then
+    date -d "+${in} days" +%F
+  else
+    date -d "$in" +%F 2>/dev/null
+  fi
+}
+
+expiry_of() {  # user -> YYYY-MM-DD | never
+  local d; d=$(getent shadow "$1" | cut -d: -f8)
+  if [[ $d =~ ^[0-9]+$ ]]; then date -u -d "@$((d * 86400))" +%F; else echo never; fi
+}
+
+status_of() {  # user -> Active|Expired|Locked
+  local f pw d today; f=$(getent shadow "$1")
+  pw=$(cut -d: -f2 <<<"$f"); d=$(cut -d: -f8 <<<"$f"); today=$(( $(date +%s) / 86400 ))
+  if [[ $d =~ ^[0-9]+$ ]] && (( today > d )); then echo Expired
+  elif [[ $pw == '!'* ]]; then echo Locked
+  else echo Active; fi
+}
+
+pick_user() {  # prompts, sets global U ; returns 1 when invalid
+  read -rp "Enter username: " U
+  if [ -z "$U" ] || ! is_nilana_user "$U"; then
+    bad "User '$U' does not exist (or was not created by Nilana VPS)."; return 1
+  fi
+}
+
+account_card() {  # user pass expiry
+  clear; logo; line
+  echo "  * Account Details *"; line
+  printf '  %sHost          :%s %s\n' "$CBL" "$C0" "$HOST"
+  [ -n "$DOMAIN" ] && printf '  %sServer IP     :%s %s\n' "$CBL" "$C0" "$PUBIP"
+  printf '  %sUsername      :%s %s\n' "$CBL" "$C0" "$1"
+  [ -n "$2" ] && printf '  %sPassword      :%s %s\n' "$CBL" "$C0" "$2"
+  printf '  %sExpires On    :%s %s\n' "$CG" "$C0" "$3"
+  line
+  printf '  OpenSSH   : %s\n  Dropbear  : %s\n  SSL (SNI) : %s\n' \
+    "$SSH_PORT" "${DROPBEAR_PORTS// /, }" "${STUNNEL_PORTS// /, }"
+  [ -n "$SQUID_PORTS" ] && printf '  Squid     : %s\n' "${SQUID_PORTS// /, }"
+  printf '  UDPGW     : 127.0.0.1:%s\n' "$UDPGW_PORT"
+  line
+}
+
+# ---------------------------------------------------------------- users
+add_user() {
+  line; read -rp "※ Enter Username : " u
+  if ! [[ $u =~ ^[a-z_][a-z0-9_-]{2,30}$ ]]; then
+    bad "Invalid username (3-31 chars: a-z, 0-9, _ or -, must start with a letter)."; return; fi
+  if getent passwd "$u" >/dev/null; then bad "Username '$u' already exists!"; return; fi
+  read -rp "※ Enter Password : " p
+  [ -n "$p" ] || { bad "Password cannot be empty."; return; }
+  read -rp "※ Total Days To Exp Or Y-M-D : " e
+  exp=$(calc_expiry "$e") || true
+  [ -n "${exp:-}" ] || { bad "Invalid expiry. Use a number of days (30) or a date (2027-01-31)."; return; }
+  if useradd -M -N -s /bin/false -c "$MARK" -e "$exp" "$u" && printf '%s:%s\n' "$u" "$p" | chpasswd; then
+    account_card "$u" "$p" "$(date -d "$exp" +%d-%m-%Y)"
+  else
+    bad "Failed to create user."; userdel "$u" 2>/dev/null
+  fi
+}
+
+renew_user() {
+  line; pick_user || return
+  echo "* Today                  : $(date +%F)"
+  echo "* Current expiry         : $(expiry_of "$U")  ($(status_of "$U"))"
+  read -rp "* Total Days To Exp Or Y-M-D : " e
+  exp=$(calc_expiry "$e") || true
+  [ -n "${exp:-}" ] || { bad "Invalid expiry."; return; }
+  usermod -e "$exp" "$U" && usermod -U "$U" 2>/dev/null
+  ok "Renewed. New expiry: $(date -d "$exp" +%d-%m-%Y)"
+}
+
+delete_user() {
+  line; pick_user || return
+  read -rp "Delete user '$U' → [y/N] : " a
+  if [[ $a =~ ^[Yy]$ ]]; then
+    nilana-online --kick-user "$U" >/dev/null 2>&1
+    pkill -KILL -u "$U" 2>/dev/null
+    userdel "$U" 2>/dev/null && ok "User $U deleted." || bad "Could not delete $U."
+  else echo "Cancelled."; fi
+}
+
+lock_unlock_user() {
+  line; pick_user || return
+  if [ "$(status_of "$U")" = Locked ]; then
+    usermod -U "$U" && ok "User $U unlocked."
+  else
+    usermod -L "$U" && nilana-online --kick-user "$U" >/dev/null 2>&1; ok "User $U locked and disconnected."
+  fi
+}
+
+user_list() {  # $1 = all|active|expired
+  local mode=$1 n=0 u st
+  clear; line; printf '%-4s %-18s %-12s %s\n' "#" "USERNAME" "EXPIRES" "STATUS"; line
+  while read -r u; do
+    [ -n "$u" ] || continue
+    st=$(status_of "$u")
+    case $mode in
+      active)  [ "$st" = Active ]  || continue ;;
+      expired) [ "$st" = Expired ] || continue ;;
+    esac
+    n=$((n+1)); printf '%-4s %-18s %-12s %s\n' "$n." "$u" "$(expiry_of "$u")" "$st"
+  done < <(nilana_users)
+  line; echo "TOTAL: $n"; line
+}
+
+# ---------------------------------------------------------------- system
+ports_list() {
+  clear; logo; line
+  printf '%s  OpenSSH Port : %s\n  Dropbear Port: %s\n  Stunnel Port : %s\n' "$CBL" "$SSH_PORT" "$DROPBEAR_PORTS" "$STUNNEL_PORTS"
+  [ -n "$SQUID_PORTS" ] && printf '  Squid Port   : %s\n' "$SQUID_PORTS"
+  printf '  Badvpn Port  : %s (local)\n%s' "$UDPGW_PORT" "$C0"
+  line; echo "  Server IP    : $PUBIP"
+  [ -n "$DOMAIN" ] && echo "  Domain       : $DOMAIN"
+  line
+}
+
+services_status() {
+  local s st p
+  line
+  for s in $SERVICES; do
+    st=$(systemctl is-active "$s" 2>/dev/null)
+    if [ "$st" = active ]; then printf '  %-18s %s%s%s\n' "$s" "$CG" "running" "$C0"
+    else
+      printf '  %-18s %s%s%s\n' "$s" "$CR" "${st:-not found}" "$C0"
+      journalctl -u "$s" -n 4 --no-pager 2>/dev/null | sed 's/^/        /'
+    fi
+  done
+  line; echo "  Listening ports:"
+  for p in $SSH_PORT $DROPBEAR_PORTS $STUNNEL_PORTS $SQUID_PORTS; do
+    if ss -H -ltn "sport = :$p" 2>/dev/null | grep -q .; then printf '   %s%-6s open%s\n' "$CG" "$p" "$C0"
+    else printf '   %s%-6s CLOSED%s\n' "$CR" "$p" "$C0"; fi
+  done
+  if ss -H -lun "sport = :$UDPGW_PORT" 2>/dev/null | grep -q . || ss -H -ltn "sport = :$UDPGW_PORT" 2>/dev/null | grep -q .; then
+    printf '   %s%-6s open (udpgw)%s\n' "$CG" "$UDPGW_PORT" "$C0"; else printf '   %s%-6s CLOSED (udpgw)%s\n' "$CR" "$UDPGW_PORT" "$C0"; fi
+  line
+}
+
+restart_services() {
+  local s
+  for s in $SERVICES; do systemctl restart "$s" 2>/dev/null && ok "restarted $s" || bad "failed: $s"; done
+}
+
+limiter_toggle() {
+  if systemctl is-enabled --quiet nilana-limiter.timer 2>/dev/null; then
+    systemctl disable --now nilana-limiter.timer >/dev/null 2>&1
+    ok "Multi-login limit: OFF  (users can connect from many devices)"
+  else
+    systemctl enable --now nilana-limiter.timer >/dev/null 2>&1
+    ok "Multi-login limit: ON  (one active device per account, checked every 10 s)"
+  fi
+}
+
+limiter_state() { systemctl is-enabled --quiet nilana-limiter.timer 2>/dev/null && echo "${CG}ON${C0}" || echo "${CR}OFF${C0}"; }
+
+banner_menu() {
+  line; echo " 1) Use colourful HTML banner (HTTP Injector / NetMod / HTTP Custom ...)"
+  echo " 2) Use plain-text banner (PuTTY / terminal)"
+  echo " 3) Edit current banner with nano"
+  echo " 4) Back"; line
+  read -rp "Choice: " b
+  case $b in
+    1) cp /etc/nilana/banner.html /etc/issue.net ;;
+    2) cp /etc/nilana/banner.txt  /etc/issue.net ;;
+    3) nano /etc/issue.net ;;
+    *) return ;;
+  esac
+  local size; size=$(wc -c </etc/issue.net)
+  if [ "$size" -gt 1900 ]; then bad "Banner is $size bytes. Dropbear ignores banners above 2000 bytes - please shorten it."; fi
+  systemctl restart nilana-dropbear 2>/dev/null; systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+  ok "Banner applied ($size bytes)."
+}
+
+refresh_ip() {
+  local new priv
+  new=$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || curl -4fsS --max-time 8 https://ifconfig.me 2>/dev/null)
+  priv=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+  if ! [[ $new =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then bad "Could not detect the public IP."; return; fi
+  sed -i "s/^PUBIP=.*/PUBIP=$new/; s/^PRIVIP=.*/PRIVIP=$priv/" "$CONF"
+  PUBIP=$new
+  [ -d /etc/squid ] && [ "$SQUID_ENABLED" = 1 ] && { echo "# generated by Nilana VPS - do not edit (use menu: Update Server IP)"
+    echo "acl nilana_self dst 127.0.0.1/32"
+    [ -n "$priv" ] && [ "$priv" != "$new" ] && echo "acl nilana_self dst $priv/32"
+    echo "acl nilana_self dst $new/32"; } >/etc/squid/nilana-dst.conf
+  if [ "$SQUID_ENABLED" = 1 ]; then systemctl restart squid && ok "Server IP is now $new (Squid ACL refreshed)."
+  else ok "Server IP is now $new."; fi
+}
+
+
+set_conf() {  # key value  (stored in /etc/nilana/server.conf)
+  local t; t=$(mktemp)
+  grep -v "^$1=" "$CONF" >"$t" 2>/dev/null; printf '%s="%s"\n' "$1" "$2" >>"$t"
+  cat "$t" >"$CONF"; rm -f "$t"
+}
+
+repair_stunnel() {
+  line; echo " Rebuilding Stunnel (certificate, config, service, boot link) ..."; line
+  if [ -x /usr/local/sbin/nilana-stunnel-setup ]; then /usr/local/sbin/nilana-stunnel-setup
+  else bad "nilana-stunnel-setup is missing - run: menu update"; fi
+}
+
+update_script() {
+  line; echo " Update Nilana VPS"; line
+  local url=${UPDATE_URL:-} tmp new a
+  if [ -z "$url" ]; then
+    echo " Enter the RAW url of install.sh in your GitHub repo, e.g."
+    echo " https://raw.githubusercontent.com/USER/Nilana-VPS/main/install.sh"
+    read -rp " URL: " url
+  fi
+  [[ $url =~ ^https://[^[:space:]]+$ ]] || { bad "Invalid URL (must start with https://)."; return; }
+  tmp=$(mktemp)
+  if ! curl -fsSL --retry 3 --max-time 60 -o "$tmp" "$url"; then bad "Download failed."; rm -f "$tmp"; return; fi
+  if ! bash -n "$tmp" 2>/dev/null || ! grep -q '^NILANA_VERSION=' "$tmp"; then
+    bad "That file is not a valid Nilana installer."; rm -f "$tmp"; return; fi
+  new=$(sed -n 's/^NILANA_VERSION="\(.*\)"/\1/p' "$tmp" | head -n1)
+  echo " Installed: ${VERSION:-unknown}     Available: ${new:-unknown}"
+  echo " Your users, banner and settings are kept."
+  read -rp " Update now? [y/N] " a
+  [[ $a =~ ^[Yy]$ ]] || { echo "Cancelled."; rm -f "$tmp"; return; }
+  set_conf UPDATE_URL "$url"
+  NILANA_UPDATE_URL="$url" bash "$tmp" --update
+  rm -f "$tmp"
+  echo; read -rp "Press Enter to reopen the menu..." _
+  exec /usr/local/bin/menu
+}
+
+uninstall_script() {
+  local a du dp u p b
+  line; printf '%s This removes Nilana VPS: services, menu, firewall rules and settings.%s\n' "$CR" "$C0"; line
+  read -rp " Type UNINSTALL to continue: " a
+  [ "$a" = UNINSTALL ] || { echo "Cancelled."; return; }
+  read -rp " Also delete ALL Nilana user accounts? [y/N] " du
+  read -rp " Also remove packages (dropbear-bin, stunnel4, squid)? [y/N] " dp
+  echo
+
+  echo " - stopping services"
+  for u in nilana-limiter.timer nilana-expire.timer nilana-limiter.service nilana-expire.service \
+           nilana-cleanup.timer nilana-reboot.timer nilana-cleanup.service nilana-reboot.service \
+           nilana-stunnel nilana-dropbear nilana-badvpn; do
+    systemctl disable --now "$u" >/dev/null 2>&1
+  done
+  rm -f /etc/systemd/system/nilana-*.service /etc/systemd/system/nilana-*.timer
+  find /etc/systemd/system -xtype l -name 'nilana-*' -delete 2>/dev/null
+  systemctl unmask dropbear.service stunnel4.service >/dev/null 2>&1
+  systemctl daemon-reload
+
+  if [[ $du =~ ^[Yy]$ ]]; then
+    echo " - deleting Nilana accounts"
+    while read -r u; do
+      [ -n "$u" ] || continue
+      nilana-online --kick-user "$u" >/dev/null 2>&1; pkill -KILL -u "$u" 2>/dev/null; userdel "$u" 2>/dev/null
+    done < <(nilana_users)
+  fi
+
+  echo " - restoring SSH settings and banner"
+  rm -f /etc/ssh/sshd_config.d/00-nilana.conf
+  [ -f /etc/nilana/issue.net.orig ] && cp /etc/nilana/issue.net.orig /etc/issue.net
+  if sshd -t 2>/dev/null; then systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; fi
+
+  echo " - removing firewall rules (port $SSH_PORT is left open)"
+  for p in $DROPBEAR_PORTS $STUNNEL_PORTS $SQUID_PORTS; do
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw delete allow "$p/tcp" >/dev/null 2>&1
+    fi
+    for b in iptables ip6tables; do
+      command -v "$b" >/dev/null 2>&1 || continue
+      while "$b" -w -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do :; done
+    done
+  done
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+
+  echo " - squid"
+  if [ -f /etc/squid/squid.conf.orig ]; then cp /etc/squid/squid.conf.orig /etc/squid/squid.conf; fi
+  rm -f /etc/squid/nilana-dst.conf
+
+  if [[ $dp =~ ^[Yy]$ ]]; then
+    echo " - removing packages"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y dropbear-bin stunnel4 squid >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1
+    rm -rf /etc/dropbear
+  else
+    systemctl restart squid >/dev/null 2>&1
+  fi
+
+  echo " - deleting files"
+  rm -f /etc/systemd/journald.conf.d/nilana.conf /etc/sysctl.d/98-nilana-swap.conf
+  for u in ModemManager.service udisks2.service packagekit.service fwupd.service fwupd-refresh.timer motd-news.timer; do
+    systemctl is-enabled "$u" 2>&1 | grep -q masked && systemctl unmask "$u" >/dev/null 2>&1
+  done
+  rm -f /etc/sysctl.d/99-nilana.conf /etc/profile.d/nilana.sh /etc/stunnel/nilana.pem \
+        /usr/local/bin/badvpn-udpgw /usr/local/sbin/nilana-online /usr/local/sbin/nilana-stunnel-setup \
+        /usr/local/sbin/nilana-cleanup /var/log/nilana-cleanup.log \
+        /usr/local/bin/nilana
+  rm -rf /etc/nilana /run/nilana
+  rm -f /usr/local/bin/menu
+  echo; ok "Nilana VPS has been removed."
+  echo " (Reinstall any time with install.sh. The BBR setting is reset at the next reboot.)"
+  exit 0
+}
+
+
+set_domain() {
+  line; echo " Domain for this VPS (current: ${DOMAIN:-none})"
+  echo " Create an A record  <domain> -> $PUBIP  at your DNS provider"
+  echo " (DNS only / grey cloud - NOT proxied). Leave empty to remove the domain."; line
+  local d ip a
+  read -rp " Domain: " d
+  d=$(printf '%s' "$d" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+  if [ -z "$d" ]; then
+    set_conf DOMAIN ""; DOMAIN=""; HOST=$PUBIP
+    ok "Domain removed."
+  else
+    [[ $d =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { bad "That is not a valid domain name."; return; }
+    ip=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1; exit}')
+    if [ "$ip" = "$PUBIP" ]; then ok "DNS check: $d -> $ip (matches this server)"
+    else
+      bad "DNS check: $d resolves to '${ip:-nothing}', this server is $PUBIP."
+      echo " (New records can take a few minutes. Cloudflare must be DNS-only.)"
+      read -rp " Save the domain anyway? [y/N] " a
+      [[ $a =~ ^[Yy]$ ]] || { echo "Cancelled."; return; }
+    fi
+    set_conf DOMAIN "$d"; DOMAIN=$d; HOST=$d
+    ok "Domain saved: $d"
+  fi
+  echo " Re-issuing the SSL certificate for the new name ..."
+  DOMAIN=$DOMAIN /usr/local/sbin/nilana-stunnel-setup
+}
+
+
+reboot_time() { sed -n 's/^OnCalendar=\*-\*-\* \([0-9:]*\):00$/\1/p' /etc/systemd/system/nilana-reboot.timer 2>/dev/null | head -n1; }
+reboot_state() {
+  systemctl is-enabled --quiet nilana-reboot.timer 2>/dev/null && echo "${CG}ON $(reboot_time)${C0}" || echo "${CR}OFF${C0}"
+}
+
+cleanup_toggle() {
+  if [ ! -f /etc/systemd/system/nilana-cleanup.timer ]; then bad "Clean-up timer is missing - run: menu update"; return; fi
+  if systemctl is-enabled --quiet nilana-cleanup.timer 2>/dev/null; then
+    systemctl disable --now nilana-cleanup.timer >/dev/null 2>&1; ok "Auto clean-up: OFF"
+  else
+    systemctl enable --now nilana-cleanup.timer >/dev/null 2>&1; ok "Auto clean-up: ON (daily 03:30)"
+  fi
+}
+
+cleanup_now() {
+  echo " Cleaning ..."; /usr/local/sbin/nilana-cleanup
+  df -h / | awk 'NR==2{print " Disk: " $3 " used of " $2 " (" $5 ")"}'
+  echo " Memory:"; free -h | awk 'NR<=2{print "   " $0}'
+}
+
+reboot_menu() {
+  local c t
+  line; printf ' Auto reboot: %s     server time: %s (%s)\n' "$(reboot_state)" "$(date +%H:%M)" "$(date +%Z)"; line
+  echo " 1) Turn ON / OFF"; echo " 2) Change reboot time"; echo " 3) Back"; line
+  read -rp " Choice: " c
+  case $c in
+    1) if [ ! -f /etc/systemd/system/nilana-reboot.timer ]; then bad "Reboot timer is missing - run: menu update"; return; fi
+       if systemctl is-enabled --quiet nilana-reboot.timer 2>/dev/null; then
+         systemctl disable --now nilana-reboot.timer >/dev/null 2>&1; ok "Auto reboot: OFF"
+       else
+         systemctl enable --now nilana-reboot.timer >/dev/null 2>&1; ok "Auto reboot: ON at $(reboot_time) - all users are disconnected for ~1 minute"
+       fi ;;
+    2) read -rp " New time (24h HH:MM, e.g. 00:00 or 04:30): " t
+       if ! [[ $t =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then bad "Invalid time."; return; fi
+       [ -f /etc/systemd/system/nilana-reboot.timer ] || { bad "Reboot timer is missing - run: menu update"; return; }
+       sed -i "s/^OnCalendar=.*/OnCalendar=*-*-* $t:00/; s/^Description=.*/Description=Nilana VPS - daily reboot at $t/" /etc/systemd/system/nilana-reboot.timer
+       systemctl daemon-reload
+       systemctl is-enabled --quiet nilana-reboot.timer 2>/dev/null && systemctl restart nilana-reboot.timer
+       ok "Reboot time set to $t ($(date +%Z))." ;;
+    *) return ;;
+  esac
+}
+
+
+resources() {
+  local n r
+  line; echo "  Memory"; free -m | awk 'NR==2{printf "   RAM : %d MB used of %d MB  (%d MB available)\n",$3,$2,$7} NR==3{printf "   Swap: %d MB used of %d MB\n",$3,$2}'
+  line; df -h / | awk 'NR==2{print "  Disk : " $3 " used of " $2 " (" $5 ")"}'
+  echo "  Load : $(cut -d' ' -f1-3 /proc/loadavg)     Uptime: $(uptime -p)"
+  echo "  CPUs : $(nproc)"
+  line; echo "  Memory used by Nilana services"
+  for n in sshd dropbear stunnel4 squid badvpn-udpgw; do
+    r=$(ps -C "$n" -o rss= 2>/dev/null | awk '{s+=$1} END{if (NR>0) printf "%.1f MB", s/1024}')
+    [ -n "$r" ] && printf '   %-14s %s\n' "$n" "$r"
+  done
+  line
+}
+
+
+print_menu() {
+  local items=() i half n
+  items+=(" 1) Ports List" " 2) Add User" " 3) Renew User" " 4) Delete User" " 5) Lock / Unlock User"
+          " 6) Users List" " 7) Expired Users" " 8) Active Users" " 9) Online Users"
+          "10) Multi-login Limit" "11) Services Status" "12) Restart Services" "13) Banner Settings")
+  [ "$PROFILE" = lite ] || items+=("14) Speedtest")
+  items+=("15) Monitor (htop)" "16) Change User Password" "17) Update Server IP" "18) Repair Stunnel (SSL)"
+          "19) Update Script" "20) Uninstall Script")
+  [ "$PROFILE" = lite ] || items+=("21) Set / Change Domain")
+  items+=("22) Auto Clean-up ON/OFF" "23) Clean Up Now" "24) Auto Reboot / Time" "25) System Resources")
+  n=${#items[@]}; half=$(( (n + 1) / 2 ))
+  for ((i = 0; i < half; i++)); do
+    printf '  %-30s %s\n' "${items[i]}" "${items[i + half]:-}"
+  done
+  echo "   0) Quit"
+}
+
+# ---------------------------------------------------------------- main loop
+main_menu() {
+  while true; do
+    clear; logo; line
+    printf '  Server: %s    Multi-login limit: %s\n' "$HOST" "$(limiter_state)"
+    printf '  Auto reboot: %s     Time now: %s\n' "$(reboot_state)" "$(date +%H:%M)"; line
+    print_menu
+    line
+    read -rp " Choose [0-25]: " c
+    clear
+    case $c in
+      1) ports_list ;;
+      2) add_user ;;
+      3) renew_user ;;
+      4) delete_user ;;
+      5) lock_unlock_user ;;
+      6) user_list all ;;
+      7) user_list expired ;;
+      8) user_list active ;;
+      9) nilana-online ;;
+      10) limiter_toggle ;;
+      11) services_status ;;
+      12) restart_services ;;
+      13) banner_menu ;;
+      14) if command -v speedtest-cli >/dev/null; then speedtest-cli --simple; else bad "speedtest-cli not installed"; fi ;;
+      15) if command -v htop >/dev/null; then htop; else top; fi ;;
+      16) pick_user && passwd "$U" ;;
+      17) refresh_ip ;;
+      18) repair_stunnel ;;
+      19) update_script ;;
+      20) uninstall_script ;;
+      21) if [ "$PROFILE" = lite ]; then bad "Domain is not used in Lite - you connect with the server IP."; else set_domain; fi ;;
+      22) cleanup_toggle ;;
+      23) cleanup_now ;;
+      24) reboot_menu ;;
+      25) resources ;;
+      0|q|Q) clear; exit 0 ;;
+      *) bad "Invalid option." ;;
+    esac
+    pause
+  done
+}
+
+case "${1:-}" in
+  update)    update_script ;;
+  uninstall) uninstall_script ;;
+  repair|stunnel) repair_stunnel ;;
+  domain)    set_domain ;;
+  cleanup)   cleanup_now ;;
+  resources) resources ;;
+  *) main_menu ;;
+esac
+__NILANA_MENU__
+chmod 755 /usr/local/bin/menu.new && mv -f /usr/local/bin/menu.new /usr/local/bin/menu   # new inode: a running menu is never corrupted
+ln -sf /usr/local/bin/menu /usr/local/bin/nilana
+
+cat >/etc/systemd/system/nilana-expire.service <<'EOF'
+[Unit]
+Description=Nilana VPS - lock expired accounts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nilana-online --expire
+EOF
+cat >/etc/systemd/system/nilana-expire.timer <<'EOF'
+[Unit]
+Description=Nilana VPS - expiry check every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
+EOF
+cat >/etc/systemd/system/nilana-limiter.service <<'EOF'
+[Unit]
+Description=Nilana VPS - one active device per account
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nilana-online --kick-extra
+EOF
+cat >/etc/systemd/system/nilana-limiter.timer <<EOF
+[Unit]
+Description=Nilana VPS - multi-login check
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${LIMIT_EVERY}s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+# ---- housekeeping: daily clean-up + nightly reboot
+# (unit files are only created once, so changes made in the menu survive updates)
+cat >/usr/local/sbin/nilana-cleanup.new <<'__NILANA_CLEANUP__'
+#!/usr/bin/env bash
+# Nilana VPS - safe housekeeping.   Runs daily (nilana-cleanup.timer) and before the auto-reboot.
+export DEBIAN_FRONTEND=noninteractive
+LOG=/var/log/nilana-cleanup.log
+before=$(df -m / | awk 'NR==2{print $4}')
+{
+  echo "== $(date '+%F %T') clean-up"
+  # unused packages / old kernels / apt cache
+  apt-get -o DPkg::Lock::Timeout=120 -y autoremove --purge >/dev/null 2>&1
+  apt-get -y autoclean >/dev/null 2>&1
+  apt-get -y clean >/dev/null 2>&1
+  # journal and rotated / oversized logs
+  journalctl --vacuum-time=3d --vacuum-size=100M >/dev/null 2>&1
+  find /var/log -xdev -type f \( -name '*.gz' -o -name '*.[0-9]' -o -name '*.old' \) -mtime +7 -delete 2>/dev/null
+  find /var/log -xdev -type f -name '*.log' -size +50M ! -path '/var/log/journal/*' -exec truncate -s 0 {} + 2>/dev/null
+  # stale temp files and crash dumps
+  find /tmp /var/tmp -xdev -type f -atime +3 -delete 2>/dev/null
+  rm -rf /var/crash/* 2>/dev/null
+  # page cache only (never touches data)
+  sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
+  after=$(df -m / | awk 'NR==2{print $4}')
+  echo "disk free: ${after} MB (changed by $((after - before)) MB)"
+} >>"$LOG" 2>&1
+if [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 200000 ]; then tail -n 200 "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"; fi
+tail -n 1 "$LOG"
+__NILANA_CLEANUP__
+chmod 755 /usr/local/sbin/nilana-cleanup.new && mv -f /usr/local/sbin/nilana-cleanup.new /usr/local/sbin/nilana-cleanup
+CLEAN_NEW=0; REBOOT_NEW=0
+if [ ! -f /etc/systemd/system/nilana-cleanup.timer ]; then
+  CLEAN_NEW=1
+  cat >/etc/systemd/system/nilana-cleanup.service <<'EOF'
+[Unit]
+Description=Nilana VPS - clean-up (logs, apt cache, temp files)
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/nilana-cleanup
+EOF
+  cat >/etc/systemd/system/nilana-cleanup.timer <<'EOF'
+[Unit]
+Description=Nilana VPS - daily clean-up
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+if [ ! -f /etc/systemd/system/nilana-reboot.timer ]; then
+  REBOOT_NEW=1
+  cat >/etc/systemd/system/nilana-reboot.service <<'EOF'
+[Unit]
+Description=Nilana VPS - clean-up and scheduled reboot
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/nilana-cleanup
+ExecStart=/usr/bin/systemctl reboot
+EOF
+  cat >/etc/systemd/system/nilana-reboot.timer <<EOF
+[Unit]
+Description=Nilana VPS - daily reboot at $REBOOT_TIME
+
+[Timer]
+OnCalendar=*-*-* $REBOOT_TIME:00
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+
+cat >/etc/profile.d/nilana.sh <<'EOF'
+# Nilana VPS hint for administrators
+if [ -n "${PS1:-}" ] && [ "$(id -u)" -eq 0 ] && [ -x /usr/local/bin/menu ]; then
+  printf '\n  \033[36;1mNILANA VPS\033[0m - type \033[33;1mmenu\033[0m to manage users and services\n\n'
+fi
+EOF
+ok "menu installed  (type: menu)"
+
+# ---------------------------------------------------------------- firewall
+step "Opening firewall ports"
+TCP_PORTS=("${DROPBEAR_PORTS[@]}" "${SQUID_PORTS[@]}")
+for m in "${STUNNEL_MAP[@]}"; do TCP_PORTS+=("${m%%:*}"); done
+TCP_PORTS+=("$SSH_PORT")
+UDP_PORTS=()
+if [ "$UDPGW_LISTEN" != "127.0.0.1" ]; then TCP_PORTS+=("$UDPGW_PORT"); UDP_PORTS+=("$UDPGW_PORT"); fi
+
+ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; }
+fw_open() {   # proto port
+  local proto=$1 port=$2 b
+  if ufw_active; then ufw allow "$port/$proto" >/dev/null 2>&1; return; fi
+  for b in iptables ip6tables; do
+    command -v "$b" >/dev/null 2>&1 || continue
+    "$b" -w -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
+      || "$b" -w -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+  done
+}
+if ufw_active; then
+  info "ufw is active - using ufw rules"
+else
+  echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections 2>/dev/null
+  echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections 2>/dev/null
+  command -v netfilter-persistent >/dev/null 2>&1 || apt_get install iptables-persistent >/dev/null 2>&1 \
+    || warn "iptables-persistent missing - rules will not survive a reboot"
+fi
+for p in "${TCP_PORTS[@]}"; do fw_open tcp "$p"; done
+for p in "${UDP_PORTS[@]}"; do fw_open udp "$p"; done
+if ! ufw_active; then
+  if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 && ok "Firewall rules saved (persist after reboot)"
+  else mkdir -p /etc/iptables && iptables-save >/etc/iptables/rules.v4; fi
+fi
+ok "Opened TCP: ${TCP_PORTS[*]}"
+if ! ufw_active && [ -f /etc/iptables/rules.v4 ] && ! grep -q -- "--dport ${STUNNEL_MAP[0]%%:*} " /etc/iptables/rules.v4; then
+  fail "firewall rules were not saved to /etc/iptables/rules.v4 - ports could be blocked after a reboot"
+fi
+
+# ------------------------------------------------------------ start it all
+step "Starting services"
+allow_services
+systemctl daemon-reload
+for u in "${SVC_UNITS[@]}"; do
+  [ -f "/etc/systemd/system/$u.service" ] || [ "$u" = squid ] || continue
+  systemctl enable "$u" >/dev/null 2>&1
+  systemctl restart "$u" 2>/dev/null
+done
+systemctl enable --now nilana-expire.timer >/dev/null 2>&1
+[ "$CLEAN_NEW" = 1 ] && systemctl enable --now nilana-cleanup.timer >/dev/null 2>&1
+if [ "$REBOOT_NEW" = 1 ] && [ "$ENABLE_REBOOT" = 1 ]; then systemctl enable --now nilana-reboot.timer >/dev/null 2>&1; fi
+# prove every unit is enabled for the next boot (create the link by hand if systemctl could not)
+for u in "${SVC_UNITS[@]}"; do
+  [ -f "/etc/systemd/system/$u.service" ] || [ "$u" = squid ] || continue
+  systemctl is-enabled --quiet "$u" 2>/dev/null && continue
+  warn "$u was not enabled for boot - fixing"
+  [ -f "/etc/systemd/system/$u.service" ] && ln -sf "/etc/systemd/system/$u.service" "/etc/systemd/system/multi-user.target.wants/$u.service"
+  systemctl daemon-reload; systemctl enable "$u" >/dev/null 2>&1
+  systemctl is-enabled --quiet "$u" 2>/dev/null || fail "$u will NOT start after a reboot"
+done
+sleep 3
+
+check_listen() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
+chk_unit() { if systemctl is-active --quiet "$1"; then ok "$1 is running"; else fail "$1 is NOT running  (journalctl -u $1 -n 20)"; fi; }
+systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null && ok "OpenSSH is running" || fail "OpenSSH is NOT running"
+chk_unit nilana-dropbear
+chk_unit nilana-stunnel
+[ "$SQUID_ON" -eq 1 ] && chk_unit squid
+[ -f /etc/systemd/system/nilana-badvpn.service ] && chk_unit nilana-badvpn
+for p in "$SSH_PORT" "${DROPBEAR_PORTS[@]}" "${SQUID_PORTS[@]}"; do check_listen "$p" || fail "nothing is listening on TCP $p"; done
+for m in "${STUNNEL_MAP[@]}"; do check_listen "${m%%:*}" || fail "nothing is listening on TCP ${m%%:*}"; done
+check_listen "$UDPGW_PORT" || fail "nothing is listening on $UDPGW_PORT (badvpn-udpgw)"
+
+for u in "${SVC_UNITS[@]}"; do
+  systemctl is-failed --quiet "$u" && { warn "last log lines of $u:"; journalctl -u "$u" -n 6 --no-pager 2>/dev/null | sed 's/^/        /'; }
+done
+
+# ----------------------------------------------------------------- summary
+echo
+printf '%s================================================================%s\n' "$C" "$N"
+logo
+printf '  %sServer IP%s   : %s\n' "$B" "$N" "$PUBIP"
+[ -n "$DOMAIN" ] && printf '  %sDomain%s      : %s\n' "$B" "$N" "$DOMAIN"
+printf '  %sOpenSSH%s     : %s\n' "$B" "$N" "$SSH_PORT"
+printf '  %sDropbear%s    : %s\n' "$B" "$N" "${DROPBEAR_PORTS[*]}"
+printf '  %sStunnel SSL%s : %s\n' "$B" "$N" "$(printf '%s ' "${STUNNEL_MAP[@]%%:*}" | sed 's/ $//')"
+if [ "$SQUID_ON" -eq 1 ]; then printf '  %sSquid%s       : %s\n' "$B" "$N" "${SQUID_PORTS[*]}"; else printf '  %sSquid%s       : not installed\n' "$B" "$N"; fi
+printf '  %sBadVPN UDPGW%s: %s:%s\n' "$B" "$N" "$UDPGW_LISTEN" "$UDPGW_PORT"
+if systemctl is-enabled --quiet nilana-reboot.timer 2>/dev/null; then
+  RB="reboot every night at $(sed -n 's/^OnCalendar=\*-\*-\* \([0-9:]*\):00$/\1/p' /etc/systemd/system/nilana-reboot.timer | head -n1) ($(date +%Z))"
+else RB="auto-reboot is OFF"; fi
+printf '  %sProfile%s     : %s\n' "$B" "$N" "$([ "$LITE" -eq 1 ] && echo 'LITE (low RAM / CPU)' || echo 'Full')"
+free -m | awk -v b="$B" -v n="$N" 'NR==2{printf "  %sRAM in use%s  : %d / %d MB\n", b, n, $3, $2} NR==3 && $2>0{printf "  %sSwap%s        : %d / %d MB\n", b, n, $3, $2}'
+printf '  %sMaintenance%s : daily clean-up 03:30, %s\n' "$B" "$N" "$RB"
+printf '%s================================================================%s\n' "$C" "$N"
+if [ "$UPDATE_MODE" -eq 1 ]; then printf '  %sNilana VPS updated to v%s%s\n' "$G" "$NILANA_VERSION" "$N"; fi
+if [ ${#FAILED[@]} -eq 0 ]; then
+  printf '  %sAll services are running.%s\n' "$G" "$N"
+else
+  printf '  %sSome parts need attention:%s\n' "$R" "$N"; for f in "${FAILED[@]}"; do printf '   - %s\n' "$f"; done
+  printf '  Full log: %s\n' "$LOG"
+fi
+cat <<EOF
+
+  ${Y}ORACLE CLOUD - one manual step (cannot be automated from inside the VM):${N}
+  Console -> Networking -> Virtual Cloud Networks -> your VCN -> Security Lists
+  -> Add Ingress Rules:  Source CIDR 0.0.0.0/0 , IP protocol TCP ,
+  Destination ports:  442,443,445,555,3128,8000,8080   (22 is open by default)
+
+  Create your first account:   ${G}menu${N}  ->  2) Add User
+  Banner / multi-login / expiry are all inside the menu.
+EOF
+if [ -f /var/run/reboot-required ]; then
+  warn "A reboot is recommended (kernel/libraries were upgraded):  sudo reboot"
+fi
+[ ${#FAILED[@]} -eq 0 ]; finish $?
